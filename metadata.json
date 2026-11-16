@@ -1,0 +1,6 @@
+{
+  "name": "Snajperrr",
+  "description": "Discord music bot with a web dashboard, Spotify/Discord authentication, and Stripe integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

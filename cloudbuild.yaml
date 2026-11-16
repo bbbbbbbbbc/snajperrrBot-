@@ -1,0 +1,64 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - -t
+      - '$_IMAGE_NAME:$COMMIT_SHA'
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - '$_IMAGE_NAME:$COMMIT_SHA'
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: /bin/bash
+    args:
+      - -c
+      - |
+        if gcloud run services describe $_SERVICE_NAME \
+              --region=$_DEPLOY_REGION \
+              --platform=managed \
+              --format=yaml > /tmp/service.yaml 2>&1; then
+          # Service exists: the Cloud Run API validates the stale
+          # run.googleapis.com/sources annotation even on partial updates, so
+          # neither `services update --remove-annotations` nor `services replace`
+          # with the unmodified YAML works.  Instead: describe → strip stale
+          # annotations and update the image in Python → replace with clean YAML.
+          python3 - "$_IMAGE_NAME:$COMMIT_SHA" << 'PYEOF'
+        import yaml, sys
+        image = sys.argv[1]
+        with open('/tmp/service.yaml') as f:
+            svc = yaml.safe_load(f)
+        stale = ['run.googleapis.com/sources', 'run.googleapis.com/build-id']
+        for ann in [
+            svc.get('metadata', {}).get('annotations', {}),
+            svc.get('spec', {}).get('template', {}).get('metadata', {}).get('annotations', {}),
+        ]:
+            for k in stale:
+                ann.pop(k, None)
+        svc['spec']['template']['spec']['containers'][0]['image'] = image
+        with open('/tmp/service.yaml', 'w') as f:
+            yaml.dump(svc, f, default_flow_style=False)
+        PYEOF
+          gcloud run services replace /tmp/service.yaml \
+            --region=$_DEPLOY_REGION \
+            --platform=managed
+        else
+          # Service does not exist yet — create it with a standard deploy.
+          gcloud run deploy $_SERVICE_NAME \
+            --image=$_IMAGE_NAME:$COMMIT_SHA \
+            --region=$_DEPLOY_REGION \
+            --platform=managed
+        fi
+
+substitutions:
+  _SERVICE_NAME: discord-music-bot-dashboard
+  _DEPLOY_REGION: us-west2
+  _IMAGE_NAME: us-west2-docker.pkg.dev/gen-lang-client-0542481418/cloud-run-source-deploy/snajperrr/discord-music-bot-dashboard
+
+images:
+  - '$_IMAGE_NAME:$COMMIT_SHA'

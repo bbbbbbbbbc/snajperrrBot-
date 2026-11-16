@@ -1,0 +1,91 @@
+{
+  "users": [],
+  "vouchers": [],
+  "redeemedVouchers": [],
+  "guildsPremium": [],
+  "warnings": [],
+  "logs": [
+    {
+      "id": 1,
+      "level": "info",
+      "source": "system",
+      "message": "SnajperBot Control Panel uruchomiony pomyślnie.",
+      "details": "API endpoints, Web Player, Video Channels i Integrations Hub aktywne.",
+      "solution": null,
+      "created_at": 1794861981147
+    }
+  ],
+  "bugs": [],
+  "broadcasts": [],
+  "videoChannels": [
+    {
+      "id": "cinema-general",
+      "name": "kino-ogolne",
+      "currentVideo": {
+        "id": "default-lofi-stream",
+        "title": "Lofi Hip Hop Radio — Beats to Relax/Study to",
+        "url": "https://www.youtube.com/watch?v=jfKfPfyJRdk",
+        "embedUrl": "https://www.youtube.com/embed/jfKfPfyJRdk?autoplay=0&rel=0",
+        "provider": "youtube",
+        "addedBy": "System",
+        "addedAt": 1794861981147,
+        "thumbnail": "https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg"
+      },
+      "isPlaying": false,
+      "queue": [],
+      "history": [],
+      "updatedAt": 1794862001105
+    },
+    {
+      "id": "watch-party",
+      "name": "watch-party",
+      "currentVideo": null,
+      "isPlaying": false,
+      "queue": [],
+      "history": [],
+      "updatedAt": 1794861981147
+    },
+    {
+      "id": "music-videos",
+      "name": "teledyski-live",
+      "currentVideo": null,
+      "isPlaying": false,
+      "queue": [],
+      "history": [],
+      "updatedAt": 1794861981147
+    }
+  ],
+  "integrations": {
+    "discord-webhook": {
+      "integrationId": "discord-webhook",
+      "enabled": true,
+      "endpointUrl": "",
+      "apiKey": "",
+      "channelTarget": "#muzyka-logi",
+      "events": [
+        "track_started",
+        "video_queued"
+      ],
+      "updatedAt": 1794861981147,
+      "lastStatus": "Ready"
+    },
+    "youtube-data-api": {
+      "integrationId": "youtube-data-api",
+      "enabled": true,
+      "endpointUrl": "https://www.youtube.com",
+      "apiKey": "",
+      "channelTarget": "youtubei.js",
+      "events": [
+        "track_started",
+        "video_queued"
+      ],
+      "updatedAt": 1794861981147,
+      "lastStatus": "HTTP 400",
+      "lastTriggeredAt": 1794862001173
+    }
+  },
+  "lastRepair": null,
+  "nextLogId": 2,
+  "nextBugId": 1,
+  "nextBroadcastId": 1
+}
