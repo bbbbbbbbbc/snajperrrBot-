@@ -23,6 +23,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { CHANGELOG } from '../constants';
+import { YouTubeFastImporter } from '../components/YouTubeFastImporter';
 
 interface DashboardTabProps {
   status: BotStatus | null;
@@ -44,6 +45,7 @@ interface DashboardTabProps {
   handleRemoveTrack: (guildId: string, trackId: string) => void;
   sensors: any;
   setShowChangelog: (v: boolean) => void;
+  onRefreshPlayers?: () => void;
 }
 
 function SortableQueueItem({ item, onRemove }: { item: QueueItem, onRemove: () => void }) {
@@ -74,7 +76,7 @@ function SortableQueueItem({ item, onRemove }: { item: QueueItem, onRemove: () =
 }
 
 export const DashboardTab: React.FC<DashboardTabProps> = ({
-  status, players, searchQuery, setSearchQuery, handleSearch, isSearching, searchTargetGuild, setSearchTargetGuild, searchResults, handlePlayFromWeb, formatTime, handlePlaybackToggle, handleVolumeChange, handleSkipForward, setClearConfirmGuildId, handleDragEnd, handleRemoveTrack, sensors, setShowChangelog
+  status, players, searchQuery, setSearchQuery, handleSearch, isSearching, searchTargetGuild, setSearchTargetGuild, searchResults, handlePlayFromWeb, formatTime, handlePlaybackToggle, handleVolumeChange, handleSkipForward, setClearConfirmGuildId, handleDragEnd, handleRemoveTrack, sensors, setShowChangelog, onRefreshPlayers
 }) => {
   const latestVersion = CHANGELOG[0];
 
@@ -187,6 +189,15 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
           </div>
         )}
       </div>
+      <YouTubeFastImporter
+        targetType="music"
+        targetId={searchTargetGuild || (players[0]?.guildId ?? 'web-channel')}
+        targetLabel={
+          players.find((p) => p.guildId === (searchTargetGuild || players[0]?.guildId))?.guildName ||
+          'Web Channel Audio'
+        }
+        onImported={() => onRefreshPlayers?.()}
+      />
       <div className="space-y-4">
         <h3 className="text-lg font-bold text-white flex items-center gap-2 mb-4"><Music className="w-5 h-5 text-[#5865F2]" />Aktywne Odtwarzacze <span className="text-xs font-mono text-slate-400 tabular-nums">({players.length})</span></h3>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

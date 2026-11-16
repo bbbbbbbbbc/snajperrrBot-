@@ -15,6 +15,7 @@ import {
 import { apiFetch } from '../lib/api';
 import type { VideoChannel } from '../types';
 import { cn } from '../lib/utils';
+import { YouTubeFastImporter } from '../components/YouTubeFastImporter';
 
 export const VideoChannelsTab: React.FC = () => {
   const [channels, setChannels] = useState<VideoChannel[]>([]);
@@ -375,6 +376,15 @@ export const VideoChannelsTab: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {activeChannel && (
+        <YouTubeFastImporter
+          targetType="video"
+          targetId={activeChannel.id}
+          targetLabel={`#${activeChannel.name}`}
+          onImported={() => loadChannels()}
+        />
+      )}
 
       {/* Add Direct URL & YouTube Search */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

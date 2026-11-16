@@ -849,6 +849,7 @@ export default function App() {
                   handleRemoveTrack={handleRemoveTrack}
                   sensors={sensors}
                   setShowChangelog={setShowChangelog}
+                  onRefreshPlayers={refreshPlayersAndStatus}
                 />
               )}
               {activeTab === 'video' && <VideoChannelsTab />}

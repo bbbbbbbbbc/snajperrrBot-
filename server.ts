@@ -17,8 +17,12 @@ import {
 import { Player } from "discord-player";
 import { DefaultExtractors, SpotifyExtractor } from "@discord-player/extractor";
 import { YoutubeiExtractor } from "discord-player-youtubei";
-import { Innertube, UniversalCache } from "youtubei.js";
 import { globalDownloader } from "./src/lib/AdvancedDownloader.ts";
+import {
+  youtubeImporter,
+  extractYouTubeVideoId,
+  formatDurationSec,
+} from "./src/lib/youtubeImporter.ts";
 import jwt from "jsonwebtoken";
 import Stripe from "stripe";
 import crypto from "crypto";
@@ -55,7 +59,6 @@ const SESSION_COOKIE = "snajper_session";
 const APP_VERSION = "2.9.5";
 
 let botStartTime = Date.now();
-let innertubeClient: Innertube | null = null;
 let stripeClient: Stripe | null = null;
 let aiAssistant: GoogleGenAI | null = null;
 
@@ -72,16 +75,6 @@ if (geminiKey && geminiKey !== "MY_GEMINI_API_KEY" && !geminiKey.startsWith("YOU
 }
 if (process.env.STRIPE_SECRET_KEY) {
   stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY);
-}
-
-async function getInnertube(): Promise<Innertube> {
-  if (!innertubeClient) {
-    innertubeClient = await Innertube.create({
-      cache: new UniversalCache(false),
-      generate_session_locally: true,
-    });
-  }
-  return innertubeClient;
 }
 
 function getBaseUrl(req: express.Request): string {
@@ -258,35 +251,8 @@ function parseDurationStringToSec(dur: any): number {
   return parts[0] || 0;
 }
 
-function formatDurationSec(sec: number): string {
-  if (!sec || sec <= 0) return "0:00";
-  const hrs = Math.floor(sec / 3600);
-  const mins = Math.floor((sec % 3600) / 60);
-  const rem = Math.floor(sec % 60);
-  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
-  return `${mins}:${String(rem).padStart(2, "0")}`;
-}
-
 function extractYouTubeId(inputUrl: string): string | null {
-  try {
-    const u = new URL(inputUrl);
-    if (u.hostname.includes("youtu.be")) {
-      return u.pathname.replace(/^\//, "").split("/")[0] || null;
-    }
-    if (u.hostname.includes("youtube.com")) {
-      if (u.searchParams.get("v")) return u.searchParams.get("v");
-      const parts = u.pathname.split("/").filter(Boolean);
-      if (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "live") {
-        return parts[1] || null;
-      }
-    }
-  } catch {
-    // Not a full URL; check raw 11-char ID
-    if (/^[a-zA-Z0-9_-]{11}$/.test(inputUrl.trim())) {
-      return inputUrl.trim();
-    }
-  }
-  return null;
+  return extractYouTubeVideoId(inputUrl);
 }
 
 function parseVideoSource(rawUrl: string, customTitle?: string, addedBy = "Web User"): VideoItem {
@@ -439,7 +405,17 @@ let extractorsLoaded = false;
 async function ensureExtractors() {
   if (extractorsLoaded) return;
   try {
-    await player.extractors.register(YoutubeiExtractor, {});
+    const ytCookies = process.env.YOUTUBE_COOKIES?.trim() || undefined;
+    await player.extractors.register(YoutubeiExtractor, {
+      streamOptions: {
+        useClient: "TV_EMBEDDED",
+        highWaterMark: 1024 * 1024 * 16,
+      },
+      innertubeConfigRaw: {
+        generate_session_locally: true,
+        ...(ytCookies ? { cookie: ytCookies } : {}),
+      },
+    });
     if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
       await player.extractors.register(SpotifyExtractor, {
         clientId: SPOTIFY_CLIENT_ID,
@@ -506,6 +482,27 @@ const musicCommands = [
     )
     .addStringOption((o) => o.setName("title").setDescription("Opcjonalny tytuł filmu"))
     .addStringOption((o) => o.setName("channel").setDescription("Nazwa pokoju wideo (domyślnie kino-ogolne)")),
+  new SlashCommandBuilder()
+    .setName("import")
+    .setDescription("Szybko importuje playlistę, kanał lub listę linków YouTube")
+    .addStringOption((o) =>
+      o.setName("source").setDescription("Link do playlisty/kanału/filmu YouTube").setRequired(true)
+    )
+    .addStringOption((o) =>
+      o
+        .setName("target")
+        .setDescription("Cel importu (muzyka lub wideo)")
+        .addChoices(
+          { name: "Muzyka (kanał głosowy / web)", value: "music" },
+          { name: "Kanał Wideo", value: "video" }
+        )
+    )
+    .addStringOption((o) =>
+      o.setName("channel").setDescription("Nazwa kanału wideo (tylko dla celu Wideo)")
+    )
+    .addIntegerOption((o) =>
+      o.setName("limit").setDescription("Maksymalna liczba pozycji do importu (1-100)")
+    ),
 ];
 
 client.once("clientReady", async () => {
@@ -581,6 +578,82 @@ client.on("interactionCreate", async (interaction) => {
       if (item.thumbnail) embed.setThumbnail(item.thumbnail);
 
       await interaction.reply({ embeds: [embed] });
+      return;
+    }
+
+    if (commandName === "import") {
+      const source = interaction.options.getString("source", true);
+      const target = interaction.options.getString("target") || "music";
+      const roomName = (interaction.options.getString("channel") || "cinema-general").toLowerCase();
+      const limit = Math.max(1, Math.min(100, interaction.options.getInteger("limit") || 50));
+
+      await interaction.deferReply();
+      const imported = await youtubeImporter.importBatch(source, { maxItems: limit });
+      if (imported.tracks.length === 0) {
+        await interaction.editReply("Nie znaleziono żadnych filmów ani utworów do zaimportowania.");
+        return;
+      }
+
+      if (target === "video") {
+        let channel = storeState.videoChannels.find(
+          (c) => c.id === roomName || c.name.toLowerCase() === roomName
+        );
+        if (!channel) {
+          channel = {
+            id: roomName.replace(/[^a-z0-9-]+/g, "-") || crypto.randomUUID(),
+            name: roomName,
+            discordChannelId: interaction.channelId,
+            currentVideo: null,
+            isPlaying: false,
+            queue: [],
+            history: [],
+            updatedAt: Date.now(),
+          };
+          storeState.videoChannels.push(channel);
+        }
+
+        for (const t of imported.tracks) {
+          const item = parseVideoSource(t.url, t.title, interaction.user.tag);
+          if (!channel.currentVideo) {
+            channel.currentVideo = item;
+            channel.isPlaying = true;
+          } else {
+            channel.queue.push(item);
+          }
+        }
+        channel.updatedAt = Date.now();
+        saveStore();
+
+        await interaction.editReply(
+          `🎬 Zaimportowano **${imported.tracks.length}** filmów do kanału **#${channel.name}** w **${imported.durationMs} ms**.`
+        );
+        return;
+      }
+
+      const member = interaction.member as GuildMember | null;
+      const voiceChannel = member?.voice?.channel;
+      if (voiceChannel && interaction.guild) {
+        await ensureExtractors();
+        let queued = 0;
+        for (const t of imported.tracks) {
+          try {
+            await player.play(voiceChannel, t.url, {
+              nodeOptions: { metadata: interaction.channel },
+            });
+            queued++;
+          } catch {}
+        }
+        await interaction.editReply(
+          `⚡ Zaimportowano **${queued}/${imported.tracks.length}** utworów z YouTube w **${imported.durationMs} ms** (${imported.sourceTitle || "YouTube"}).`
+        );
+      } else {
+        for (const t of imported.tracks) {
+          queueTrackToWebPlayer(t);
+        }
+        await interaction.editReply(
+          `⚡ Zaimportowano **${imported.tracks.length}** utworów do **Web Channel** w **${imported.durationMs} ms** (dołącz do kanału głosowego, aby odtwarzać bezpośrednio na Discordzie).`
+        );
+      }
       return;
     }
 
@@ -937,45 +1010,7 @@ app.get("/api/search", async (req, res) => {
   }
 
   try {
-    const yt = await getInnertube();
-    const ytId = extractYouTubeId(query);
-
-    if (ytId) {
-      const info = await yt.getBasicInfo(ytId);
-      const dur = info.basic_info.duration || 0;
-      return res.json({
-        success: true,
-        tracks: [
-          {
-            id: ytId,
-            videoId: ytId,
-            title: info.basic_info.title || `YouTube (${ytId})`,
-            author: info.basic_info.author || "YouTube",
-            duration: formatDurationSec(dur),
-            durationSeconds: dur,
-            thumbnail: `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
-            url: `https://www.youtube.com/watch?v=${ytId}`,
-          },
-        ],
-      });
-    }
-
-    const search = await yt.search(query, { type: "video" });
-    const tracks = (search.videos || []).slice(0, 12).map((v: any) => {
-      const durSec = typeof v.duration?.seconds === "number" ? v.duration.seconds : 0;
-      const vidId = v.id;
-      return {
-        id: vidId,
-        videoId: vidId,
-        title: v.title?.text || v.title?.toString() || "Nieznany utwór",
-        author: v.author?.name || "YouTube",
-        duration: v.duration?.text || formatDurationSec(durSec),
-        durationSeconds: durSec,
-        thumbnail: v.thumbnails?.[0]?.url || (vidId ? `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg` : ""),
-        url: vidId ? `https://www.youtube.com/watch?v=${vidId}` : "",
-      };
-    });
-
+    const tracks = await youtubeImporter.searchVideos(query, 12);
     return res.json({ success: true, tracks });
   } catch (err: any) {
     logEvent("warn", "search", `Wyszukiwanie "${query}" nie powiodło się`, err?.message || "");
@@ -1001,12 +1036,7 @@ app.get("/api/audio/stream", async (req, res) => {
   }
 
   try {
-    const yt = await getInnertube();
-    const webStream = await yt.download(videoId, {
-      type: "audio",
-      quality: "best",
-      format: "mp4",
-    });
+    const webStream = await youtubeImporter.openAudioStream(videoId);
 
     res.setHeader("Content-Type", "audio/mp4");
     res.setHeader("Cache-Control", "no-store");
@@ -1085,6 +1115,63 @@ app.get("/api/players", (_req, res) => {
   res.json([webPlayer, ...discordPlayers]);
 });
 
+function queueTrackToWebPlayer(track: {
+  url: string;
+  title?: string;
+  author?: string;
+  duration?: string | number;
+  durationSeconds?: number;
+  thumbnail?: string;
+  videoId?: string;
+}) {
+  const ytId = track.videoId || extractYouTubeId(track.url);
+  const resolvedTitle = track.title || "Utwór audio";
+  const resolvedAuthor = track.author || "Web Stream";
+  const resolvedDuration =
+    typeof track.durationSeconds === "number" && track.durationSeconds > 0
+      ? track.durationSeconds
+      : parseDurationStringToSec(track.duration);
+  const resolvedThumb =
+    track.thumbnail || (ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : "");
+
+  const trackItem: QueueItem = {
+    id: crypto.randomUUID(),
+    title: resolvedTitle,
+    author: resolvedAuthor,
+    duration: resolvedDuration,
+    url: track.url,
+    videoId: ytId || undefined,
+    thumbnail: resolvedThumb,
+  };
+
+  if (!webPlayerState.nowPlaying) {
+    webPlayerState.nowPlaying = {
+      id: trackItem.id,
+      title: trackItem.title,
+      author: trackItem.author,
+      duration: trackItem.duration,
+      startedAt: Date.now(),
+      pausedAt: null,
+      elapsedBeforePause: 0,
+      thumbnail: resolvedThumb,
+      url: track.url,
+      videoId: ytId || undefined,
+    };
+    webPlayerState.state = "playing";
+    webPlayerState.history.unshift({
+      title: trackItem.title,
+      author: trackItem.author,
+      duration: formatDurationSec(trackItem.duration),
+      playedAt: Date.now(),
+      url: track.url,
+    });
+    webPlayerState.history = webPlayerState.history.slice(0, 50);
+  } else {
+    webPlayerState.queue.push(trackItem);
+  }
+  return trackItem;
+}
+
 app.post("/api/players/:guildId/play", async (req, res) => {
   const { guildId } = req.params;
   const { url, title, author, duration, thumbnail } = req.body || {};
@@ -1105,61 +1192,34 @@ app.post("/api/players/:guildId/play", async (req, res) => {
     }
   }
 
-  // Web Channel Player
+  // Web Channel Player (uses LRU-cached youtubeImporter)
   try {
     const ytId = extractYouTubeId(url);
-    let resolvedTitle = title || "Utwór audio";
-    let resolvedAuthor = author || "Web Stream";
+    let resolvedTitle = title;
+    let resolvedAuthor = author;
     let resolvedDuration = parseDurationStringToSec(duration);
-    let resolvedThumb = thumbnail || (ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : "");
+    let resolvedThumb = thumbnail;
 
-    if (ytId && (!title || !resolvedDuration)) {
+    if (ytId && (!resolvedTitle || !resolvedDuration)) {
       try {
-        const yt = await getInnertube();
-        const info = await yt.getBasicInfo(ytId);
-        resolvedTitle = title || info.basic_info.title || resolvedTitle;
-        resolvedAuthor = author || info.basic_info.author || resolvedAuthor;
-        resolvedDuration = resolvedDuration || info.basic_info.duration || 0;
+        const meta = await youtubeImporter.resolveVideo(ytId);
+        resolvedTitle = resolvedTitle || meta.title;
+        resolvedAuthor = resolvedAuthor || meta.author;
+        resolvedDuration = resolvedDuration || meta.durationSeconds;
+        resolvedThumb = resolvedThumb || meta.thumbnail;
       } catch {
-        // Use fallback metadata if Innertube metadata lookup fails
+        // Use fallback metadata if YouTube lookup fails
       }
     }
 
-    const trackItem: QueueItem = {
-      id: crypto.randomUUID(),
+    const trackItem = queueTrackToWebPlayer({
+      url,
+      videoId: ytId || undefined,
       title: resolvedTitle,
       author: resolvedAuthor,
       duration: resolvedDuration,
-      url,
-      videoId: ytId || undefined,
       thumbnail: resolvedThumb,
-    };
-
-    if (!webPlayerState.nowPlaying) {
-      webPlayerState.nowPlaying = {
-        id: trackItem.id,
-        title: trackItem.title,
-        author: trackItem.author,
-        duration: trackItem.duration,
-        startedAt: Date.now(),
-        pausedAt: null,
-        elapsedBeforePause: 0,
-        thumbnail: resolvedThumb,
-        url,
-        videoId: ytId || undefined,
-      };
-      webPlayerState.state = "playing";
-      webPlayerState.history.unshift({
-        title: trackItem.title,
-        author: trackItem.author,
-        duration: formatDurationSec(trackItem.duration),
-        playedAt: Date.now(),
-        url,
-      });
-      webPlayerState.history = webPlayerState.history.slice(0, 50);
-    } else {
-      webPlayerState.queue.push(trackItem);
-    }
+    });
 
     dispatchIntegrationEvent("track_started", {
       guildId: "web-channel",
@@ -1354,9 +1414,8 @@ app.post("/api/video/channels/:channelId/play", async (req, res) => {
   const ytId = extractYouTubeId(url);
   if (ytId && !resolvedTitle) {
     try {
-      const yt = await getInnertube();
-      const info = await yt.getBasicInfo(ytId);
-      resolvedTitle = info.basic_info.title || undefined;
+      const meta = await youtubeImporter.resolveVideo(ytId);
+      resolvedTitle = meta.title || undefined;
     } catch {
       // Fallback to default YouTube title
     }
@@ -1428,6 +1487,160 @@ app.delete("/api/video/channels/:channelId/queue/:videoId", (req, res) => {
   channel.updatedAt = Date.now();
   saveStore();
   return res.json({ success: true, channel });
+});
+
+// ==================== DEDICATED HIGH-SPEED YOUTUBE IMPORTER ROUTES ====================
+
+app.get("/api/youtube/stats", (_req, res) => {
+  res.json({ success: true, stats: youtubeImporter.getStats() });
+});
+
+app.post("/api/youtube/preview", async (req, res) => {
+  const source = req.body?.source ?? req.body?.url ?? "";
+  const maxItems = Number(req.body?.maxItems || 100);
+  if (!source || (typeof source === "string" && !source.trim())) {
+    return res.status(400).json({ success: false, error: "Podaj link do playlisty, kanału lub listę linków YouTube." });
+  }
+
+  try {
+    const result = await youtubeImporter.importBatch(source, { maxItems, concurrency: 6 });
+    return res.json({ success: true, ...result, stats: youtubeImporter.getStats() });
+  } catch (err: any) {
+    logEvent("warn", "youtube-import", "Błąd podglądu importu YouTube", err?.message || "");
+    return res.status(500).json({ success: false, error: err?.message || "Import failed" });
+  }
+});
+
+app.post("/api/youtube/import", async (req, res) => {
+  const source = req.body?.source ?? req.body?.url ?? "";
+  const targetType: "music" | "video" = req.body?.targetType === "video" ? "video" : "music";
+  const targetId = String(req.body?.targetId || (targetType === "video" ? "cinema-general" : "web-channel"));
+  const mode: "now" | "queue" = req.body?.mode === "now" ? "now" : "queue";
+  const maxItems = Math.max(1, Math.min(250, Number(req.body?.maxItems || 100)));
+
+  if (!source || (typeof source === "string" && !source.trim())) {
+    return res.status(400).json({ success: false, error: "Brak źródła do zaimportowania." });
+  }
+
+  try {
+    const result = await youtubeImporter.importBatch(source, { maxItems, concurrency: 6 });
+    if (result.tracks.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Nie znaleziono żadnych utworów ani filmów dla podanego źródła.",
+        failed: result.failed,
+      });
+    }
+
+    if (targetType === "video") {
+      const channel = storeState.videoChannels.find((c) => c.id === targetId);
+      if (!channel) {
+        return res.status(404).json({ success: false, error: "Nie znaleziono kanału wideo." });
+      }
+      const user = getAuthenticatedUser(req);
+      const addedBy = user?.username || "YouTube Importer";
+
+      result.tracks.forEach((t, idx) => {
+        const item = parseVideoSource(t.url, t.title, addedBy);
+        if (idx === 0 && (mode === "now" || !channel.currentVideo)) {
+          if (channel.currentVideo) {
+            channel.history.unshift(channel.currentVideo);
+            channel.history = channel.history.slice(0, 30);
+          }
+          channel.currentVideo = item;
+          channel.isPlaying = true;
+        } else {
+          channel.queue.push(item);
+        }
+      });
+
+      channel.updatedAt = Date.now();
+      saveStore();
+      logEvent(
+        "info",
+        "youtube-import",
+        `Zaimportowano ${result.tracks.length} filmów do #${channel.name} w ${result.durationMs}ms.`
+      );
+      return res.json({
+        success: true,
+        importedCount: result.tracks.length,
+        durationMs: result.durationMs,
+        cacheHits: result.cacheHits,
+        sourceKind: result.sourceKind,
+        sourceTitle: result.sourceTitle,
+        failed: result.failed,
+        channel,
+        stats: youtubeImporter.getStats(),
+      });
+    }
+
+    // Music player target (Discord guild OR Web Channel)
+    if (targetId !== "web-channel") {
+      const queue = player.nodes.get(targetId);
+      if (!queue || !queue.channel) {
+        return res.status(404).json({
+          success: false,
+          error: "Brak aktywnego kanału głosowego na wybranym serwerze Discord.",
+        });
+      }
+      await ensureExtractors();
+      let queuedCount = 0;
+      for (const t of result.tracks) {
+        try {
+          await player.play(queue.channel, t.url);
+          queuedCount++;
+        } catch {}
+      }
+      logEvent(
+        "info",
+        "youtube-import",
+        `Zaimportowano ${queuedCount}/${result.tracks.length} utworów na serwer ${targetId} w ${result.durationMs}ms.`
+      );
+      return res.json({
+        success: true,
+        importedCount: queuedCount,
+        durationMs: result.durationMs,
+        cacheHits: result.cacheHits,
+        sourceKind: result.sourceKind,
+        sourceTitle: result.sourceTitle,
+        failed: result.failed,
+        stats: youtubeImporter.getStats(),
+      });
+    }
+
+    // Web Channel batch queueing
+    for (const t of result.tracks) {
+      queueTrackToWebPlayer(t);
+    }
+
+    dispatchIntegrationEvent("track_queued", {
+      guildId: "web-channel",
+      importedCount: result.tracks.length,
+      sourceTitle: result.sourceTitle,
+      sourceKind: result.sourceKind,
+    }).catch(() => {});
+
+    logEvent(
+      "info",
+      "youtube-import",
+      `Zaimportowano ${result.tracks.length} utworów do Web Channel w ${result.durationMs}ms.`
+    );
+
+    return res.json({
+      success: true,
+      importedCount: result.tracks.length,
+      durationMs: result.durationMs,
+      cacheHits: result.cacheHits,
+      sourceKind: result.sourceKind,
+      sourceTitle: result.sourceTitle,
+      failed: result.failed,
+      player: getWebPlayerSnapshot(),
+      stats: youtubeImporter.getStats(),
+    });
+  } catch (err: any) {
+    logEvent("error", "youtube-import", "Błąd importu YouTube", err?.message || "");
+    return res.status(500).json({ success: false, error: err?.message || "Import failed" });
+  }
 });
 
 // ==================== 1,000+ INTEGRATIONS HUB ROUTES ====================
@@ -2015,6 +2228,8 @@ export class ErrorOverlay {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+    // Pre-warm YouTube Innertube session + player scripts in background
+    youtubeImporter.warmup().catch(() => {});
     if (DISCORD_TOKEN) {
       client.login(DISCORD_TOKEN).catch((err) => {
         logEvent("warn", "discord", "Logowanie bota Discord nie powiodło się", err?.message || "");
