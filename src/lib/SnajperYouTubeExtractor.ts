@@ -1,3 +1,4 @@
+import { Readable } from 'stream';
 import {
   BaseExtractor,
   Playlist,
@@ -10,18 +11,21 @@ import {
   type SearchQueryType,
 } from 'discord-player';
 import {
+  cleanTrackSearchQuery,
   ensureYouTubeJsEvaluator,
   extractYouTubePlaylistId,
   extractYouTubeVideoId,
   formatDurationSec,
+  isSoundCloudUrl,
   isYouTubeChannelUrl,
   youtubeImporter,
   type ImportedYouTubeTrack,
 } from './youtubeImporter.ts';
 
-function isNonYouTubeHttpUrl(input: string): boolean {
+function isNonSupportedHttpUrl(input: string): boolean {
   const trimmed = input.trim();
   if (!/^https?:\/\//i.test(trimmed)) return false;
+  if (isSoundCloudUrl(trimmed)) return false;
   try {
     const host = new URL(trimmed).hostname.toLowerCase();
     return (
@@ -36,8 +40,8 @@ function isNonYouTubeHttpUrl(input: string): boolean {
 
 export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknown>> {
   static identifier = 'com.snajperbot.extractor.youtube';
-  priority = 2;
-  protocols = ['ytsearch', 'youtube', 'yt'];
+  priority = 1;
+  protocols = ['ytsearch', 'youtube', 'yt', 'scsearch', 'soundcloud'];
 
   async activate(): Promise<void> {
     ensureYouTubeJsEvaluator();
@@ -55,7 +59,11 @@ export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknow
       type === QueryType.YOUTUBE ||
       type === QueryType.YOUTUBE_VIDEO ||
       type === QueryType.YOUTUBE_PLAYLIST ||
-      type === QueryType.YOUTUBE_SEARCH
+      type === QueryType.YOUTUBE_SEARCH ||
+      type === QueryType.SOUNDCLOUD ||
+      type === QueryType.SOUNDCLOUD_TRACK ||
+      type === QueryType.SOUNDCLOUD_PLAYLIST ||
+      type === QueryType.SOUNDCLOUD_SEARCH
     ) {
       return true;
     }
@@ -63,12 +71,13 @@ export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknow
     if (
       extractYouTubeVideoId(query) ||
       extractYouTubePlaylistId(query) ||
-      isYouTubeChannelUrl(query)
+      isYouTubeChannelUrl(query) ||
+      isSoundCloudUrl(query)
     ) {
       return true;
     }
 
-    if (isNonYouTubeHttpUrl(query)) {
+    if (isNonSupportedHttpUrl(query)) {
       return false;
     }
 
@@ -85,22 +94,24 @@ export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknow
       requestedBy?: ExtractorSearchContext['requestedBy'];
       playlist?: Playlist;
       queryType?: SearchQueryType;
+      source?: 'youtube' | 'soundcloud';
     } = {}
   ): Track {
+    const sourceLabel = context.source === 'soundcloud' ? 'SoundCloud' : 'YouTube';
     const track = new Track(this.context.player, {
       title: item.title,
-      description: `${item.author} • YouTube`,
-      author: item.author || 'YouTube',
+      description: `${item.author} • ${sourceLabel}`,
+      author: item.author || sourceLabel,
       url: item.url,
       thumbnail: item.thumbnail,
       duration: item.duration || formatDurationSec(item.durationSeconds),
       views: 0,
       requestedBy: context.requestedBy ?? null,
       playlist: context.playlist,
-      source: 'youtube',
+      source: context.source || 'youtube',
       queryType: context.queryType ?? QueryType.YOUTUBE_VIDEO,
       raw: item,
-      cleanTitle: item.title,
+      cleanTitle: cleanTrackSearchQuery(item.title, item.author)[0] || item.title,
       live: false,
     });
     track.extractor = this;
@@ -110,6 +121,31 @@ export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknow
   async handle(query: string, context: ExtractorSearchContext): Promise<ExtractorInfo> {
     const trimmed = query.trim();
     if (!trimmed) return this.createResponse(null, []);
+
+    if (isSoundCloudUrl(trimmed)) {
+      const scMeta = await youtubeImporter.resolveSoundCloudMetadata(trimmed);
+      if (scMeta) {
+        const track = this.toPlayerTrack(
+          {
+            id: scMeta.url,
+            videoId: scMeta.url,
+            title: scMeta.title,
+            author: scMeta.author,
+            duration: formatDurationSec(scMeta.durationSeconds),
+            durationSeconds: scMeta.durationSeconds,
+            thumbnail: scMeta.thumbnail,
+            url: scMeta.url,
+            sourceType: 'video',
+          },
+          {
+            requestedBy: context.requestedBy,
+            queryType: QueryType.SOUNDCLOUD_TRACK,
+            source: 'soundcloud',
+          }
+        );
+        return this.createResponse(null, [track]);
+      }
+    }
 
     const listId = extractYouTubePlaylistId(trimmed);
     const vidId = extractYouTubeVideoId(trimmed);
@@ -195,30 +231,75 @@ export class SnajperYouTubeExtractor extends BaseExtractor<Record<string, unknow
   }
 
   async stream(info: Track): Promise<ExtractorStreamable> {
-    return youtubeImporter.openNodeAudioStream(info.url, {
-      title: info.title,
+    const hints = {
+      title: info.cleanTitle || info.title,
       author: info.author,
-    });
-  }
+    };
 
-  async bridge(track: Track): Promise<ExtractorStreamable | null> {
-    const query = this.createBridgeQuery(track);
-    if (!query) return null;
-    const matches = await youtubeImporter.searchVideos(query, 1);
-    const best = matches[0];
-    if (!best) {
-      const scSource = await youtubeImporter.resolveSoundCloudFallback(query, `sc:${query}`);
+    try {
+      return await youtubeImporter.openNodeAudioStream(info.url, hints);
+    } catch (primaryErr) {
+      const cleanQueries = cleanTrackSearchQuery(info.title, info.author);
+      const fallbackQuery = cleanQueries[0] || this.createBridgeQuery(info);
+      if (!fallbackQuery) throw primaryErr;
+
+      const scSource = await youtubeImporter.resolveSoundCloudFallback(
+        fallbackQuery,
+        `sc:${info.url}`,
+        hints
+      );
       if (scSource.hlsFmp4) {
-        const { Readable } = await import('stream');
         const hls = await youtubeImporter.openHlsWebStream(scSource.url);
         return Readable.fromWeb(hls.stream as any);
       }
+      const resp = await fetch(scSource.url);
+      if (!resp.ok || !resp.body) {
+        throw primaryErr;
+      }
+      return Readable.fromWeb(resp.body as any);
+    }
+  }
+
+  async bridge(track: Track): Promise<ExtractorStreamable | null> {
+    const cleanVariants = cleanTrackSearchQuery(track.title, track.author);
+    const query = cleanVariants[0] || this.createBridgeQuery(track);
+    if (!query) return null;
+
+    const hints = {
+      title: track.cleanTitle || track.title,
+      author: track.author,
+    };
+
+    try {
+      const matches = await youtubeImporter.searchVideos(query, 3);
+      for (const best of matches) {
+        try {
+          return await youtubeImporter.openNodeAudioStream(best.url, {
+            title: best.title || hints.title,
+            author: best.author || hints.author,
+          });
+        } catch {
+          // Try next match
+        }
+      }
+    } catch {
+      // Fall through directly to SoundCloud Bridge
+    }
+
+    const scSource = await youtubeImporter.resolveSoundCloudFallback(
+      query,
+      `sc:${track.url || query}`,
+      hints
+    );
+    if (scSource.hlsFmp4) {
+      const hls = await youtubeImporter.openHlsWebStream(scSource.url);
+      return Readable.fromWeb(hls.stream as any);
+    }
+    const resp = await fetch(scSource.url);
+    if (!resp.ok || !resp.body) {
       return scSource.url;
     }
-    return youtubeImporter.openNodeAudioStream(best.url, {
-      title: best.title || track.title,
-      author: best.author || track.author,
-    });
+    return Readable.fromWeb(resp.body as any);
   }
 
   async getRelatedTracks(track: Track, history: GuildQueueHistory): Promise<ExtractorInfo> {

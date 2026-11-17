@@ -52,6 +52,10 @@ import type {
 } from "./src/types.ts";
 
 const app = express();
+app.set("trust proxy", true);
+if (!process.env.FFMPEG_PATH && fs.existsSync("/usr/bin/ffmpeg")) {
+  process.env.FFMPEG_PATH = "/usr/bin/ffmpeg";
+}
 const portEnv = process.env.PORT;
 const parsedPort = portEnv ? Number.parseInt(portEnv, 10) : Number.NaN;
 const PORT = Number.isNaN(parsedPort) ? 3000 : parsedPort;
@@ -85,12 +89,32 @@ if (process.env.STRIPE_SECRET_KEY) {
 }
 
 function getBaseUrl(req: express.Request): string {
+  const rawHost = String(
+    req.headers["x-forwarded-host"] || req.headers.host || ""
+  )
+    .split(",")[0]
+    .trim();
+  if (rawHost.includes("snajperrrbot.pl")) {
+    return `https://${rawHost}`;
+  }
   if (process.env.APP_URL && process.env.APP_URL !== "MY_APP_URL") {
     return process.env.APP_URL.replace(/\/$/, "");
   }
-  const protocol = (req.headers["x-forwarded-proto"] as string) || req.protocol || "http";
-  const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || `localhost:${PORT}`;
-  return `${protocol}://${host}`;
+  const effectiveHost = rawHost || `localhost:${PORT}`;
+  const rawProto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  return `${rawProto || "https"}://${effectiveHost}`;
+}
+
+function getDefaultEmbedHost(): string {
+  if (process.env.APP_URL && process.env.APP_URL !== "MY_APP_URL") {
+    try {
+      return new URL(process.env.APP_URL).hostname;
+    } catch {}
+  }
+  return "snajperrrbot.pl";
 }
 
 function getDiscordRedirectUri(req: express.Request): string {
@@ -266,7 +290,7 @@ function parseVideoSource(
   rawUrl: string,
   customTitle?: string,
   addedBy = "Web User",
-  embedParentHost = "localhost"
+  embedParentHost = getDefaultEmbedHost()
 ): VideoItem {
   const url = rawUrl.trim();
   const id = crypto.randomUUID();
@@ -383,6 +407,21 @@ function getAuthenticatedUser(req: express.Request): StoredUser | null {
 }
 
 // Global Middlewares
+app.use((req, res, next) => {
+  res.on("finish", () => {
+    console.log({
+      method: req.method,
+      url: req.originalUrl,
+      host: req.hostname,
+      ip: req.ip,
+      forwardedProto: req.get("x-forwarded-proto"),
+      status: res.statusCode,
+    });
+  });
+
+  next();
+});
+
 app.use("/api", (_req, res, next) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
@@ -452,12 +491,30 @@ player.events.on("playerStart", (queue, track) => {
   }).catch(() => {});
 });
 
+function buildPlayerNodeOptions(metadata?: any) {
+  return {
+    ...(metadata !== undefined ? { metadata } : {}),
+    verifyFallbackStream: true,
+    bufferingTimeout: 3000,
+    leaveOnEmpty: true,
+    leaveOnEmptyCooldown: 60_000,
+    leaveOnEnd: false,
+  };
+}
+
 player.events.on("error", (_queue, error) => {
   logEvent("error", "discord-player", error.message, error.stack || "");
 });
 
-player.events.on("playerError", (_queue, error) => {
-  logEvent("error", "discord-player", error.message, error.stack || "");
+player.events.on("playerError", (queue, error, track) => {
+  const trackLabel = track?.title ? ` [${track.title}]` : "";
+  logEvent("error", "discord-player", `${error.message}${trackLabel}`, error.stack || "");
+  const channel = queue?.metadata as { send?: (msg: string) => Promise<any> } | undefined;
+  if (channel && typeof channel.send === "function") {
+    channel
+      .send(`⚠️ Nie udało się odtworzyć utworu${trackLabel ? ` **${track.title}**` : ""}: ${error.message.split("\n")[0]}`)
+      .catch(() => {});
+  }
 });
 
 const musicCommands = [
@@ -702,7 +759,8 @@ client.on("interactionCreate", async (interaction) => {
         for (const t of imported.tracks) {
           try {
             await player.play(voiceChannel, t.url, {
-              nodeOptions: { metadata: interaction.channel },
+              requestedBy: interaction.user,
+              nodeOptions: buildPlayerNodeOptions(interaction.channel),
             });
             queued++;
           } catch {}
@@ -755,7 +813,7 @@ client.on("interactionCreate", async (interaction) => {
       await ensureExtractors();
       const result = await player.play(voiceChannel, query, {
         requestedBy: interaction.user,
-        nodeOptions: { metadata: interaction.channel },
+        nodeOptions: buildPlayerNodeOptions(interaction.channel),
       });
       await interaction.editReply(
         `🎵 Dodano do kolejki: **${result.track.title}** (${result.track.duration})`
@@ -1393,7 +1451,9 @@ app.post("/api/players/:guildId/play", async (req, res) => {
     }
     try {
       await ensureExtractors();
-      const result = await player.play(queue.channel, url);
+      const result = await player.play(queue.channel, url, {
+        nodeOptions: buildPlayerNodeOptions(queue.metadata),
+      });
       return res.json({ success: true, track: result.track.title });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: err?.message || "Play failed" });
@@ -1800,7 +1860,9 @@ app.post("/api/youtube/import", async (req, res) => {
       let queuedCount = 0;
       for (const t of result.tracks) {
         try {
-          await player.play(queue.channel, t.url);
+          await player.play(queue.channel, t.url, {
+            nodeOptions: buildPlayerNodeOptions(queue.metadata),
+          });
           queuedCount++;
         } catch {}
       }
@@ -2435,8 +2497,11 @@ export class ErrorOverlay {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
+    app.use(express.static("dist"));
+    app.get("/", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+    app.use((_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

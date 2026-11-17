@@ -194,6 +194,97 @@ export function isYouTubeChannelUrl(input: string): boolean {
   }
 }
 
+export function isSoundCloudUrl(input: string): boolean {
+  try {
+    const u = new URL(input.trim());
+    const host = u.hostname.toLowerCase();
+    return host === 'soundcloud.com' || host.endsWith('.soundcloud.com');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Generates an ordered, deduplicated cascade of clean search queries from track title & author,
+ * removing YouTube clutter tags and avoiding duplicated artist names.
+ */
+export function cleanTrackSearchQuery(title?: string, author?: string): string[] {
+  const stripClutter = (raw: string) =>
+    raw
+      .replace(/[\u2012-\u2015]/g, '-')
+      .replace(/\((?:official\s*(?:music\s*)?(?:video|audio|lyric(?:s)?\s*video)?|lyric(?:s)?\s*video|lyrics|audio|visualizer|hd|4k|hq|explicit|remastered(?:\s*\d+)?|live|prod\.[^)]+)\)/gi, ' ')
+      .replace(/\[(?:official\s*(?:music\s*)?(?:video|audio)?|lyric(?:s)?|audio|hd|4k(?:\s*upgrade)?|hq|explicit|live|remastered(?:\s*\d+)?)\]/gi, ' ')
+      .replace(/\s*\|\s*[^|]+$/g, ' ')
+      .replace(/#\S+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const stripFeatured = (raw: string) =>
+    raw
+      .replace(/\s*\((?:feat\.?|ft\.?|featuring)\s+[^)]+\)/gi, ' ')
+      .replace(/\s+(?:feat\.?|ft\.?|featuring)\s+.+$/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanAuthor = stripClutter(author || '')
+    .replace(/\s*-\s*topic$/i, '')
+    .replace(/vevo$/i, '')
+    .trim();
+
+  const rawTitle = (title || '').trim();
+  const baseTitle = stripClutter(rawTitle);
+  const noFeatTitle = stripFeatured(baseTitle);
+
+  const candidates: string[] = [];
+  const pushUnique = (q: string) => {
+    const normalized = q.replace(/^[-–—\s]+|[-–—\s]+$/g, '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return;
+    if (!candidates.some((c) => c.toLowerCase() === normalized.toLowerCase())) {
+      candidates.push(normalized);
+    }
+  };
+
+  const titleContainsAuthor = (t: string, a: string) => {
+    if (!a || a.length < 2) return false;
+    const normT = t.toLowerCase().replace(/[^a-z0-9ąćęłńóśźż\s]/gi, ' ');
+    const normA = a.toLowerCase().replace(/[^a-z0-9ąćęłńóśźż\s]/gi, ' ').trim();
+    return Boolean(normA && normT.includes(normA));
+  };
+
+  if (baseTitle) {
+    if (cleanAuthor && !titleContainsAuthor(baseTitle, cleanAuthor) && cleanAuthor.toLowerCase() !== 'youtube') {
+      pushUnique(`${cleanAuthor} ${baseTitle}`);
+      pushUnique(`${baseTitle} ${cleanAuthor}`);
+    }
+    pushUnique(baseTitle);
+  }
+
+  if (noFeatTitle && noFeatTitle !== baseTitle) {
+    if (cleanAuthor && !titleContainsAuthor(noFeatTitle, cleanAuthor) && cleanAuthor.toLowerCase() !== 'youtube') {
+      pushUnique(`${cleanAuthor} ${noFeatTitle}`);
+    }
+    pushUnique(noFeatTitle);
+  }
+
+  // Handle "Artist - Title" or "Title - Artist" splits (also yields swapped/core forms)
+  const dashMatch = (noFeatTitle || baseTitle).match(/^(.+?)\s+-\s+(.+)$/);
+  if (dashMatch) {
+    const left = dashMatch[1].trim();
+    const right = dashMatch[2].trim();
+    pushUnique(`${left} ${right}`);
+    pushUnique(`${right} ${left}`);
+    if (cleanAuthor && !titleContainsAuthor(right, cleanAuthor)) {
+      pushUnique(`${cleanAuthor} ${right}`);
+    }
+  }
+
+  if (rawTitle && candidates.length === 0) {
+    pushUnique(rawTitle);
+  }
+
+  return candidates;
+}
+
 class YouTubeImporterEngine {
   private client: Innertube | null = null;
   private initPromise: Promise<Innertube> | null = null;
@@ -693,121 +784,299 @@ class YouTubeImporterEngine {
     return { title: cleanTitle, author: cleanAuthor };
   }
 
+  public async resolveSoundCloudMetadata(url: string): Promise<{
+    title: string;
+    author: string;
+    durationSeconds: number;
+    thumbnail: string;
+    url: string;
+  } | null> {
+    const sc = this.getSoundcloudClient();
+    try {
+      const track: any = await sc.tracks.getV2(url.trim());
+      if (track && track.title) {
+        const durSec = Math.round(Number(track.duration || 0) / 1000);
+        return {
+          title: String(track.title),
+          author: String(track.user?.username || 'SoundCloud'),
+          durationSeconds: durSec,
+          thumbnail: String(track.artwork_url || track.user?.avatar_url || ''),
+          url: String(track.permalink_url || url.trim()),
+        };
+      }
+    } catch {
+      // Fallback: derive readable query from SoundCloud slug
+    }
+
+    try {
+      const parsed = new URL(url.trim());
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        const artistSlug = parts[0].replace(/-/g, ' ');
+        const trackSlug = parts[1].replace(/-\d+$/, '').replace(/-/g, ' ');
+        return {
+          title: trackSlug,
+          author: artistSlug,
+          durationSeconds: 0,
+          thumbnail: '',
+          url: url.trim(),
+        };
+      }
+    } catch {
+      // Not a valid URL
+    }
+    return null;
+  }
+
   /**
    * Resolves a playable unencrypted SoundCloud stream (progressive MP3 or fMP4/MP3 HLS)
    * for any text query or SoundCloud URL. Skips DRM-encrypted HLS and 30s Go+ previews.
    */
   public async resolveSoundCloudFallback(
     query: string,
-    cacheKey = query
+    cacheKey = query,
+    hints?: AudioResolutionHints
   ): Promise<ResolvedAudioSource> {
     const cleanQuery = query.trim();
-    if (!cleanQuery) {
+    if (!cleanQuery && !hints?.title) {
       throw new Error('Brak tytułu utworu do wyszukania strumienia zapasowego.');
     }
 
     const sc = this.getSoundcloudClient();
     const clientId = await sc.api.getClientId();
 
-    const pickPlayableTranscoding = (track: any) => {
-      const list = Array.isArray(track?.media?.transcodings) ? track.media.transcodings : [];
-      const progressive = list.find(
-        (tr: any) =>
-          tr?.format?.protocol === 'progressive' &&
-          typeof tr?.url === 'string' &&
-          tr.url.length > 0
-      );
-      if (progressive) return progressive;
-
-      const hlsMp4 = list.find(
-        (tr: any) =>
-          tr?.format?.protocol === 'hls' &&
-          String(tr?.format?.mime_type || '').includes('audio/mp4') &&
-          typeof tr?.url === 'string'
-      );
-      if (hlsMp4) return hlsMp4;
-
-      return list.find(
-        (tr: any) => tr?.format?.protocol === 'hls' && typeof tr?.url === 'string'
-      );
+    const isUsableTranscoding = (tr: any): boolean => {
+      if (!tr || typeof tr.url !== 'string' || !tr.url) return false;
+      if (tr.snipped === true) return false;
+      if (tr.url.includes('/preview')) return false;
+      if (tr.preset === 'abr_sq') return false;
+      const mime = String(tr.format?.mime_type || '').toLowerCase();
+      if (mime.includes('encrypted')) return false;
+      const proto = String(tr.format?.protocol || '').toLowerCase();
+      return proto === 'progressive' || proto === 'hls';
     };
 
-    let candidate: any = null;
-    if (/^https?:\/\/(www\.)?(soundcloud\.com|on\.soundcloud\.com)\//i.test(cleanQuery)) {
+    const getOrderedTranscodings = (track: any): any[] => {
+      const list = (Array.isArray(track?.media?.transcodings) ? track.media.transcodings : []).filter(
+        isUsableTranscoding
+      );
+      const score = (tr: any) => {
+        if (tr.format?.protocol === 'progressive') return 0;
+        const mime = String(tr.format?.mime_type || '');
+        if (tr.format?.protocol === 'hls' && mime.includes('audio/mp4')) return 1;
+        return 2;
+      };
+      return [...list].sort((a, b) => score(a) - score(b));
+    };
+
+    const resolveTrackTranscoding = async (track: any): Promise<ResolvedAudioSource | null> => {
+      const transcodings = getOrderedTranscodings(track);
+      if (transcodings.length === 0) return null;
+
+      const trackAuth = track.track_authorization
+        ? `&track_authorization=${encodeURIComponent(track.track_authorization)}`
+        : '';
+
+      for (const transcoding of transcodings) {
+        try {
+          const sep = transcoding.url.includes('?') ? '&' : '?';
+          const resolveResp = await fetch(
+            `${transcoding.url}${sep}client_id=${encodeURIComponent(clientId)}${trackAuth}`,
+            { signal: AbortSignal.timeout(8000) }
+          );
+          if (!resolveResp.ok) continue;
+          const resolveJson = (await resolveResp.json()) as { url?: string };
+          const resolvedUrl = resolveJson?.url;
+          if (!resolvedUrl) continue;
+
+          const isHls = transcoding.format?.protocol === 'hls';
+          if (isHls) {
+            const mResp = await fetch(resolvedUrl, { signal: AbortSignal.timeout(8000) });
+            if (!mResp.ok) continue;
+            const mText = await mResp.text();
+            if (!mText.includes('#EXTINF') || /#EXT-X-KEY/i.test(mText)) {
+              continue;
+            }
+          }
+
+          const rawMime =
+            String(transcoding.format?.mime_type || (isHls ? 'audio/mp4' : 'audio/mpeg'))
+              .split(';')[0]
+              .trim() || 'audio/mp4';
+
+          return {
+            videoId: cacheKey,
+            url: resolvedUrl,
+            mimeType: rawMime === 'audio/mpegurl' ? 'audio/mpeg' : rawMime,
+            contentLength: null,
+            client: 'SOUNDCLOUD_BRIDGE',
+            isLive: false,
+            hlsFmp4: isHls,
+            sourceProvider: 'soundcloud',
+          };
+        } catch {
+          // Try next transcoding
+        }
+      }
+      return null;
+    };
+
+    const searchQueries: string[] = [];
+    const isScDirectUrl = isSoundCloudUrl(cleanQuery);
+
+    if (isScDirectUrl) {
       try {
-        candidate = await sc.tracks.getV2(cleanQuery);
+        const directTrack: any = await sc.tracks.getV2(cleanQuery);
+        if (directTrack) {
+          const resolvedDirect = await resolveTrackTranscoding(directTrack);
+          if (resolvedDirect) {
+            this.audioSourceCache.set(cacheKey, resolvedDirect);
+            return resolvedDirect;
+          }
+          searchQueries.push(...cleanTrackSearchQuery(directTrack.title, directTrack.user?.username));
+        }
       } catch {
-        candidate = null;
+        // Fall through to slug-derived search
+      }
+      const slugMeta = await this.resolveSoundCloudMetadata(cleanQuery);
+      if (slugMeta) {
+        searchQueries.push(...cleanTrackSearchQuery(slugMeta.title, slugMeta.author));
       }
     }
 
-    if (!candidate || !pickPlayableTranscoding(candidate)) {
-      const searchRes = await sc.tracks.searchV2({ q: cleanQuery, limit: 15 });
-      const collection = Array.isArray(searchRes?.collection) ? searchRes.collection : [];
-
-      candidate =
-        collection.find((t: any) => Number(t?.duration || 0) > 35_000 && Boolean(pickPlayableTranscoding(t))) ||
-        collection.find((t: any) => Boolean(pickPlayableTranscoding(t))) ||
-        null;
+    if (hints?.title) {
+      for (const q of cleanTrackSearchQuery(hints.title, hints.author)) {
+        if (!searchQueries.includes(q)) searchQueries.push(q);
+      }
+    }
+    if (!isScDirectUrl && cleanQuery) {
+      for (const q of cleanTrackSearchQuery(cleanQuery)) {
+        if (!searchQueries.includes(q)) searchQueries.push(q);
+      }
+      if (!searchQueries.includes(cleanQuery)) {
+        searchQueries.push(cleanQuery);
+      }
     }
 
-    if (!candidate) {
-      throw new Error(`Nie znaleziono strumienia audio dla "${cleanQuery}".`);
+    for (const q of searchQueries.slice(0, 5)) {
+      try {
+        const searchRes = await sc.tracks.searchV2({ q, limit: 15 });
+        const collection = Array.isArray(searchRes?.collection) ? searchRes.collection : [];
+        if (collection.length === 0) continue;
+
+        const orderedCandidates = [
+          ...collection.filter((t: any) => Number(t?.duration || 0) > 45_000 && getOrderedTranscodings(t).length > 0),
+          ...collection.filter((t: any) => Number(t?.duration || 0) <= 45_000 && getOrderedTranscodings(t).length > 0),
+        ];
+
+        for (const candidate of orderedCandidates.slice(0, 4)) {
+          const resolved = await resolveTrackTranscoding(candidate);
+          if (resolved) {
+            this.audioSourceCache.set(cacheKey, resolved);
+            return resolved;
+          }
+        }
+      } catch {
+        // Try next cleaned query variant
+      }
     }
 
-    const transcoding = pickPlayableTranscoding(candidate);
-    if (!transcoding) {
-      throw new Error(`Brak obsługiwanych formatów strumienia dla "${cleanQuery}".`);
+    throw new Error(`Nie znaleziono strumienia audio dla "${cleanQuery || hints?.title || ''}".`);
+  }
+
+  private async tryYouTubeClientsForVideo(videoId: string): Promise<{
+    source?: ResolvedAudioSource;
+    lastError?: unknown;
+  }> {
+    const yt = await this.getClient();
+    const clients = ['IOS', 'MWEB', 'ANDROID_VR', 'WEB'] as const;
+    let lastError: unknown = null;
+
+    for (const client of clients) {
+      try {
+        const info = await yt.getBasicInfo(videoId, { client });
+
+        if (info.basic_info?.is_live && info.streaming_data?.hls_manifest_url) {
+          return {
+            source: {
+              videoId,
+              url: info.streaming_data.hls_manifest_url,
+              mimeType: 'application/vnd.apple.mpegurl',
+              contentLength: null,
+              client,
+              isLive: true,
+              hlsUrl: info.streaming_data.hls_manifest_url,
+              sourceProvider: 'youtube',
+            },
+          };
+        }
+
+        let fmt: any = null;
+        try {
+          fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
+        } catch {
+          fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'any' });
+        }
+
+        const decipheredUrl = await fmt.decipher(yt.session.player);
+        if (!decipheredUrl) {
+          throw new Error('Empty deciphered stream URL');
+        }
+
+        // Verify CDN URL responds 200/206 (filters out 403 clients immediately)
+        const probe = await fetch(decipheredUrl, {
+          method: 'GET',
+          headers: {
+            ...Constants.STREAM_HEADERS,
+            Range: 'bytes=0-0',
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        await probe.body?.cancel().catch(() => {});
+
+        if (!probe.ok && probe.status !== 206) {
+          throw new Error(`YouTube CDN responded HTTP ${probe.status} for client ${client}`);
+        }
+
+        const rawMime = String(fmt.mime_type || 'audio/mp4').split(';')[0].trim() || 'audio/mp4';
+        const contentLength =
+          typeof fmt.content_length === 'number' && fmt.content_length > 0
+            ? fmt.content_length
+            : null;
+
+        return {
+          source: {
+            videoId,
+            url: decipheredUrl,
+            mimeType: rawMime,
+            contentLength,
+            client,
+            isLive: false,
+            sourceProvider: 'youtube',
+          },
+        };
+      } catch (err) {
+        lastError = err;
+      }
     }
 
-    const trackAuth = candidate.track_authorization
-      ? `&track_authorization=${encodeURIComponent(candidate.track_authorization)}`
-      : '';
-    const sep = transcoding.url.includes('?') ? '&' : '?';
-    const resolveResp = await fetch(
-      `${transcoding.url}${sep}client_id=${encodeURIComponent(clientId)}${trackAuth}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    if (!resolveResp.ok) {
-      throw new Error(`SoundCloud stream resolve HTTP ${resolveResp.status}`);
-    }
-    const resolveJson = (await resolveResp.json()) as { url?: string };
-    const resolvedUrl = resolveJson?.url;
-    if (!resolvedUrl) {
-      throw new Error('SoundCloud zwrócił pusty adres strumienia.');
-    }
-
-    const isHls = transcoding.format?.protocol === 'hls';
-    const rawMime =
-      String(transcoding.format?.mime_type || (isHls ? 'audio/mp4' : 'audio/mpeg'))
-        .split(';')[0]
-        .trim() || 'audio/mp4';
-
-    const resolved: ResolvedAudioSource = {
-      videoId: cacheKey,
-      url: resolvedUrl,
-      mimeType: rawMime === 'audio/mpegurl' ? 'audio/mpeg' : rawMime,
-      contentLength: null,
-      client: 'SOUNDCLOUD_BRIDGE',
-      isLive: false,
-      hlsFmp4: isHls,
-      sourceProvider: 'soundcloud',
-    };
-
-    this.audioSourceCache.set(cacheKey, resolved);
-    return resolved;
+    return { lastError };
   }
 
   /**
    * Resolves a verified, range-capable direct YouTube audio CDN URL with multi-client
    * fallback (IOS -> MWEB -> ANDROID_VR -> WEB), JS cipher evaluation, 200/206 validation,
-   * and automatic SoundCloud Bridge fallback when datacenter IPs hit LOGIN_REQUIRED.
+   * automatic SoundCloud Audio Bridge fallback, and alternate YouTube upload rescue.
    */
   public async resolveAudioStreamSource(
     videoIdOrUrl: string,
     forceRefresh = false,
     hints?: AudioResolutionHints
   ): Promise<ResolvedAudioSource> {
+    if (isSoundCloudUrl(videoIdOrUrl)) {
+      return this.resolveSoundCloudFallback(videoIdOrUrl, videoIdOrUrl.trim(), hints);
+    }
+
     const videoId = extractYouTubeVideoId(videoIdOrUrl) || videoIdOrUrl.trim();
     if (!forceRefresh) {
       const cached = this.audioSourceCache.get(videoId);
@@ -822,90 +1091,45 @@ class YouTubeImporterEngine {
 
     this.cacheMisses++;
     const promise = (async (): Promise<ResolvedAudioSource> => {
-      const yt = await this.getClient();
-      const clients = ['IOS', 'MWEB', 'ANDROID_VR', 'WEB'] as const;
-      let lastError: unknown = null;
+      const directAttempt = await this.tryYouTubeClientsForVideo(videoId);
+      if (directAttempt.source) {
+        this.audioSourceCache.set(videoId, directAttempt.source);
+        return directAttempt.source;
+      }
 
-      for (const client of clients) {
+      const lastError = directAttempt.lastError;
+      const meta = await this.resolveMetadataHints(videoId, hints);
+      const cleanVariants = cleanTrackSearchQuery(meta.title, meta.author);
+
+      // 1) Automatic SoundCloud Audio Bridge with progressively cleaned track queries
+      if (cleanVariants.length > 0) {
         try {
-          const info = await yt.getBasicInfo(videoId, { client });
-
-          if (info.basic_info?.is_live && info.streaming_data?.hls_manifest_url) {
-            const liveSource: ResolvedAudioSource = {
-              videoId,
-              url: info.streaming_data.hls_manifest_url,
-              mimeType: 'application/vnd.apple.mpegurl',
-              contentLength: null,
-              client,
-              isLive: true,
-              hlsUrl: info.streaming_data.hls_manifest_url,
-              sourceProvider: 'youtube',
-            };
-            this.audioSourceCache.set(videoId, liveSource);
-            return liveSource;
-          }
-
-          let fmt: any = null;
-          try {
-            fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
-          } catch {
-            fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'any' });
-          }
-
-          const decipheredUrl = await fmt.decipher(yt.session.player);
-          if (!decipheredUrl) {
-            throw new Error('Empty deciphered stream URL');
-          }
-
-          // Verify CDN URL responds 200/206 (filters out 403 clients immediately)
-          const probe = await fetch(decipheredUrl, {
-            method: 'GET',
-            headers: {
-              ...Constants.STREAM_HEADERS,
-              Range: 'bytes=0-0',
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          await probe.body?.cancel().catch(() => {});
-
-          if (!probe.ok && probe.status !== 206) {
-            throw new Error(`YouTube CDN responded HTTP ${probe.status} for client ${client}`);
-          }
-
-          const rawMime = String(fmt.mime_type || 'audio/mp4').split(';')[0].trim() || 'audio/mp4';
-          const contentLength =
-            typeof fmt.content_length === 'number' && fmt.content_length > 0
-              ? fmt.content_length
-              : null;
-
-          const resolved: ResolvedAudioSource = {
-            videoId,
-            url: decipheredUrl,
-            mimeType: rawMime,
-            contentLength,
-            client,
-            isLive: false,
-            sourceProvider: 'youtube',
-          };
-          this.audioSourceCache.set(videoId, resolved);
-          return resolved;
-        } catch (err) {
-          lastError = err;
+          return await this.resolveSoundCloudFallback(cleanVariants[0], videoId, meta);
+        } catch {
+          // Continue to alternate YouTube audio uploads
         }
       }
 
-      // Automatic SoundCloud Audio Bridge when YouTube blocks datacenter IPs or live recording is unavailable
-      try {
-        const meta = await this.resolveMetadataHints(videoId, hints);
-        const bridgeQuery = [meta.title, meta.author].filter(Boolean).join(' ').trim();
-        if (bridgeQuery) {
-          return await this.resolveSoundCloudFallback(bridgeQuery, videoId);
+      // 2) Alternate YouTube upload rescue (e.g. non-VEVO lyric/audio uploads without LOGIN_REQUIRED)
+      if (cleanVariants.length > 0) {
+        try {
+          const altSearch = await this.searchVideos(`${cleanVariants[0]} audio`, 5);
+          for (const alt of altSearch) {
+            if (!alt.videoId || alt.videoId === videoId) continue;
+            const altAttempt = await this.tryYouTubeClientsForVideo(alt.videoId);
+            if (altAttempt.source) {
+              const aliased: ResolvedAudioSource = { ...altAttempt.source, videoId };
+              this.audioSourceCache.set(videoId, aliased);
+              return aliased;
+            }
+          }
+        } catch {
+          // Fall through to descriptive error
         }
-      } catch {
-        // Fall through to detailed error below
       }
 
-      const rawMsg = lastError instanceof Error ? lastError.message : String(lastError || 'Audio stream unavailable');
+      const rawMsg =
+        lastError instanceof Error ? lastError.message : String(lastError || 'Audio stream unavailable');
       if (/login required|streaming data not available|confirm you.?re not a bot/i.test(rawMsg)) {
         throw new Error(
           'YouTube wymaga weryfikacji/logowania dla tego utworu i nie znaleziono zapasowego strumienia (ustaw YOUTUBE_COOKIES lub spróbuj inny utwór).'
@@ -1061,8 +1285,10 @@ class YouTubeImporterEngine {
     videoIdOrUrl: string,
     hints?: AudioResolutionHints
   ): Promise<Readable | string> {
-    const videoId = extractYouTubeVideoId(videoIdOrUrl) || videoIdOrUrl.trim();
-    const source = await this.resolveAudioStreamSource(videoId, false, hints);
+    const cacheTarget = isSoundCloudUrl(videoIdOrUrl)
+      ? videoIdOrUrl.trim()
+      : extractYouTubeVideoId(videoIdOrUrl) || videoIdOrUrl.trim();
+    const source = await this.resolveAudioStreamSource(cacheTarget, false, hints);
     if (source.isLive && source.hlsUrl) {
       return source.hlsUrl;
     }
@@ -1074,7 +1300,7 @@ class YouTubeImporterEngine {
     const headers = source.sourceProvider === 'youtube' ? Constants.STREAM_HEADERS : {};
     const resp = await fetch(source.url, { headers });
     if (!resp.ok || !resp.body) {
-      const refreshed = await this.resolveAudioStreamSource(videoId, true, hints);
+      const refreshed = await this.resolveAudioStreamSource(cacheTarget, true, hints);
       if (refreshed.isLive && refreshed.hlsUrl) return refreshed.hlsUrl;
       if (refreshed.hlsFmp4) {
         const hls = await this.openHlsWebStream(refreshed.url);
@@ -1084,7 +1310,7 @@ class YouTubeImporterEngine {
         headers: refreshed.sourceProvider === 'youtube' ? Constants.STREAM_HEADERS : {},
       });
       if (!retryResp.ok || !retryResp.body) {
-        throw new Error(`YouTube stream HTTP ${retryResp.status}`);
+        throw new Error(`Audio stream HTTP ${retryResp.status}`);
       }
       return Readable.fromWeb(retryResp.body as any);
     }
