@@ -22,6 +22,7 @@ export function GoogleDriveTab() {
   
   const [ytUrl, setYtUrl] = useState('');
   const [isDownloading, setIsDownloading] = useState(false);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Player State
   const [currentFileIndex, setCurrentFileIndex] = useState<number | null>(null);
@@ -94,13 +95,13 @@ export function GoogleDriveTab() {
       const data = await res.json();
       if (data.success) {
         setYtUrl('');
-        alert('Successfully downloaded and saved to Google Drive!');
+        setNotice({ type: 'success', text: 'Pobrano i zapisano plik na Google Drive!' });
         fetchFiles(token);
       } else {
-        alert(data.error || 'Failed to download to drive');
+        setNotice({ type: 'error', text: data.error || 'Nie udało się wysłać pliku na Google Drive.' });
       }
-    } catch (err) {
-      alert('Network error');
+    } catch {
+      setNotice({ type: 'error', text: 'Błąd sieci podczas synchronizacji z Google Drive.' });
     } finally {
       setIsDownloading(false);
     }
@@ -110,21 +111,32 @@ export function GoogleDriveTab() {
     if (currentFileIndex === index) {
       if (isPlaying) {
         audioRef.current?.pause();
-      } else {
-        audioRef.current?.play().catch(e => alert("Please open Google Drive and authorize playback: "+e.message));
+        setIsPlaying(false);
+      } else if (audioRef.current) {
+        try {
+          await audioRef.current.play();
+          setIsPlaying(true);
+        } catch (e: any) {
+          setIsPlaying(false);
+          setNotice({ type: 'error', text: `Otwórz Google Drive i autoryzuj odtwarzanie: ${e?.message || 'błąd'}` });
+        }
       }
-      setIsPlaying(!isPlaying);
       return;
     }
 
     const file = files[index];
-    const streamUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&access_token=${token}`;
+    const streamUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&access_token=${encodeURIComponent(token || '')}`;
 
     if (audioRef.current) {
-        audioRef.current.src = streamUrl;
-        audioRef.current.play().catch(e => alert("Autoplay blocked or stream error. Try clicking play again."));
-        setCurrentFileIndex(index);
+      audioRef.current.src = streamUrl;
+      setCurrentFileIndex(index);
+      try {
+        await audioRef.current.play();
         setIsPlaying(true);
+      } catch {
+        setIsPlaying(false);
+        setNotice({ type: 'error', text: 'Odtwarzanie zablokowane lub token Google Drive wygasł. Kliknij Play ponownie.' });
+      }
     }
   };
 
@@ -217,8 +229,22 @@ export function GoogleDriveTab() {
             onPlay={() => setIsPlaying(true)}
             onTimeUpdate={(e) => setProgress(e.currentTarget.currentTime)}
             onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+            onError={() => {
+              setIsPlaying(false);
+              setNotice({
+                type: 'error',
+                text: 'Nie udało się odtworzyć pliku z Google Drive (sprawdź sesję Google lub format audio).'
+              });
+            }}
             style={{ display: 'none' }}
         />
+
+        {notice && (
+          <div className={`flex items-center justify-between gap-4 px-5 py-3.5 rounded-2xl border text-sm font-medium ${notice.type === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-300' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'}`}>
+            <span>{notice.text}</span>
+            <button onClick={() => setNotice(null)} className="text-xs opacity-70 hover:opacity-100">Zamknij</button>
+          </div>
+        )}
 
         <div className="flex flex-col md:flex-row gap-8">
             {/* Player Main Panel */}

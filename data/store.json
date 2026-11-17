@@ -4,7 +4,26 @@
   "redeemedVouchers": [],
   "guildsPremium": [],
   "warnings": [],
+  "tempbans": [],
   "logs": [
+    {
+      "id": 3,
+      "level": "warn",
+      "source": "audio-stream",
+      "message": "Błąd strumienia YouTube (kJQP7kiw5Fk)",
+      "details": "YouTube wymaga weryfikacji/logowania dla tego utworu (ustaw YOUTUBE_COOKIES w środowisku serwera lub wybierz inny utwór).",
+      "solution": null,
+      "created_at": 1794915882124
+    },
+    {
+      "id": 2,
+      "level": "warn",
+      "source": "audio-stream",
+      "message": "Błąd strumienia YouTube (jfKfPfyJRdk)",
+      "details": "YouTube wymaga weryfikacji/logowania dla tego utworu (ustaw YOUTUBE_COOKIES w środowisku serwera lub wybierz inny utwór).",
+      "solution": null,
+      "created_at": 1794915881868
+    },
     {
       "id": 1,
       "level": "info",
@@ -31,10 +50,10 @@
         "addedAt": 1794861981147,
         "thumbnail": "https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg"
       },
-      "isPlaying": false,
+      "isPlaying": true,
       "queue": [],
       "history": [],
-      "updatedAt": 1794862001105
+      "updatedAt": 1794868612762
     },
     {
       "id": "watch-party",
@@ -85,7 +104,7 @@
     }
   },
   "lastRepair": null,
-  "nextLogId": 2,
+  "nextLogId": 4,
   "nextBugId": 1,
   "nextBroadcastId": 1
 }

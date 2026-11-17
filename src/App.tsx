@@ -130,6 +130,10 @@ export default function App() {
   // Managed web audio element for 'web-channel' player
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const currentStreamIdRef = useRef<string | null>(null);
+  const failedTrackKeyRef = useRef<string | null>(null);
+  const autoplayBlockedRef = useRef<boolean>(false);
+  const [audioCurrentTime, setAudioCurrentTime] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
 
   const showToast = (text: string, type: 'success' | 'error' = 'success') => {
     setToast({ text, type });
@@ -456,6 +460,10 @@ export default function App() {
         })
       });
       if (data.success) {
+        if (target === 'web-channel') {
+          failedTrackKeyRef.current = null;
+          autoplayBlockedRef.current = false;
+        }
         showToast(`Dodano do kolejki: ${track.title || 'utwór'}`);
         await refreshPlayersAndStatus();
       } else {
@@ -485,7 +493,17 @@ export default function App() {
     setPlayers((prev) => prev.map((p) => (p.guildId === guildId ? { ...p, state: newState } : p)));
     if (guildId === 'web-channel' && audioRef.current) {
       if (newState === 'playing') {
-        audioRef.current.play().catch(() => {});
+        failedTrackKeyRef.current = null;
+        autoplayBlockedRef.current = false;
+        if (audioRef.current.error) {
+          audioRef.current.load();
+        }
+        audioRef.current.play().catch((err: any) => {
+          if (err?.name === 'NotAllowedError') {
+            autoplayBlockedRef.current = true;
+            showToast('Kliknij przycisk Play, aby odblokować dźwięk w przeglądarce.');
+          }
+        });
       } else {
         audioRef.current.pause();
       }
@@ -499,7 +517,22 @@ export default function App() {
     } catch {}
   };
 
+  const handleSeekWebAudio = (guildId: string, seconds: number) => {
+    if (guildId !== 'web-channel' || !audioRef.current) return;
+    const clamped = Math.max(0, seconds);
+    try {
+      audioRef.current.currentTime = clamped;
+      setAudioCurrentTime(Math.floor(clamped));
+    } catch {}
+  };
+
   const handleSkipForward = async (guildId: string) => {
+    if (guildId === 'web-channel') {
+      failedTrackKeyRef.current = null;
+      autoplayBlockedRef.current = false;
+      setAudioCurrentTime(0);
+      setAudioDuration(0);
+    }
     try {
       await apiFetch(`/api/players/${guildId}/skip`, { method: 'POST' });
       await refreshPlayersAndStatus();
@@ -645,45 +678,100 @@ export default function App() {
 
   // Synchronize browser <audio> element with the 'web-channel' player
   const webPlayer = players.find((p) => p.guildId === 'web-channel');
+  const webNowPlaying = webPlayer?.nowPlaying ?? null;
+  const webTrackKey = webNowPlaying
+    ? webNowPlaying.id || webNowPlaying.videoId || webNowPlaying.url || webNowPlaying.title
+    : null;
+  const webPlayState = webPlayer?.state ?? 'paused';
+  const webVolume = webPlayer?.volume ?? 80;
+
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !webPlayer) return;
 
-    audio.volume = Math.max(0, Math.min(1, webPlayer.volume / 100));
+    audio.volume = Math.max(0, Math.min(1, webVolume / 100));
 
-    const track = webPlayer.nowPlaying;
-    if (!track) {
+    if (!webNowPlaying || !webTrackKey) {
       if (currentStreamIdRef.current !== null) {
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
         currentStreamIdRef.current = null;
+        failedTrackKeyRef.current = null;
+        autoplayBlockedRef.current = false;
+        setAudioCurrentTime(0);
+        setAudioDuration(0);
       }
       return;
     }
 
-    const trackKey = track.id || track.videoId || track.url || track.title;
-    if (currentStreamIdRef.current !== trackKey) {
-      const streamParam = track.videoId
-        ? `videoId=${encodeURIComponent(track.videoId)}`
-        : track.url
-          ? `url=${encodeURIComponent(track.url)}`
+    if (currentStreamIdRef.current !== webTrackKey) {
+      const baseParam = webNowPlaying.videoId
+        ? `videoId=${encodeURIComponent(webNowPlaying.videoId)}`
+        : webNowPlaying.url
+          ? `url=${encodeURIComponent(webNowPlaying.url)}`
           : '';
-      if (streamParam) {
-        currentStreamIdRef.current = trackKey;
-        audio.src = `/api/audio/stream?${streamParam}`;
-        if (webPlayer.state === 'playing') {
-          audio.play().catch(() => {});
+      if (baseParam) {
+        const hintParams = [
+          webNowPlaying.title ? `title=${encodeURIComponent(webNowPlaying.title)}` : '',
+          webNowPlaying.author ? `author=${encodeURIComponent(webNowPlaying.author)}` : '',
+        ]
+          .filter(Boolean)
+          .join('&');
+        const fullQuery = hintParams ? `${baseParam}&${hintParams}` : baseParam;
+
+        currentStreamIdRef.current = webTrackKey;
+        failedTrackKeyRef.current = null;
+        autoplayBlockedRef.current = false;
+        setAudioCurrentTime(0);
+        setAudioDuration(0);
+
+        audio.src = `/api/audio/stream?${fullQuery}`;
+        if (webPlayState === 'playing') {
+          audio.play().catch((err: any) => {
+            if (err?.name === 'NotAllowedError') {
+              autoplayBlockedRef.current = true;
+              showToast('Kliknij przycisk Play, aby odblokować dźwięk w przeglądarce.');
+            }
+          });
         }
       }
     } else {
-      if (webPlayer.state === 'playing' && audio.paused) {
-        audio.play().catch(() => {});
-      } else if (webPlayer.state === 'paused' && !audio.paused) {
+      if (webPlayState === 'playing' && audio.paused) {
+        if (failedTrackKeyRef.current === webTrackKey || autoplayBlockedRef.current) {
+          return;
+        }
+        audio.play().catch((err: any) => {
+          if (err?.name === 'NotAllowedError') {
+            autoplayBlockedRef.current = true;
+            showToast('Kliknij przycisk Play, aby odblokować dźwięk w przeglądarce.');
+          }
+        });
+      } else if (webPlayState === 'paused' && !audio.paused) {
         audio.pause();
       }
     }
-  }, [webPlayer]);
+  }, [webPlayer, webNowPlaying, webTrackKey, webPlayState, webVolume]);
+
+  const syncedPlayers = players.map((p) => {
+    if (p.guildId !== 'web-channel' || !p.nowPlaying) return p;
+    const effectiveDuration =
+      audioDuration > 0 && Number.isFinite(audioDuration)
+        ? Math.floor(audioDuration)
+        : p.nowPlaying.duration;
+    const effectiveCurrent =
+      currentStreamIdRef.current && audioCurrentTime > 0
+        ? Math.floor(audioCurrentTime)
+        : p.nowPlaying.current;
+    return {
+      ...p,
+      nowPlaying: {
+        ...p.nowPlaying,
+        current: effectiveCurrent,
+        duration: effectiveDuration,
+      },
+    };
+  });
 
   const formatTime = (s: number) => {
     if (!s || s === 0) return '0:00';
@@ -747,7 +835,111 @@ export default function App() {
       <audio
         ref={audioRef}
         className="hidden"
+        onTimeUpdate={(e) => {
+          setAudioCurrentTime(e.currentTarget.currentTime || 0);
+        }}
+        onLoadedMetadata={(e) => {
+          if (Number.isFinite(e.currentTarget.duration) && e.currentTarget.duration > 0) {
+            setAudioDuration(e.currentTarget.duration);
+          }
+        }}
+        onDurationChange={(e) => {
+          if (Number.isFinite(e.currentTarget.duration) && e.currentTarget.duration > 0) {
+            setAudioDuration(e.currentTarget.duration);
+          }
+        }}
         onEnded={() => handleSkipForward('web-channel')}
+        onError={async (e) => {
+          const audio = e.currentTarget;
+          const src = audio?.getAttribute('src');
+          if (!src) return;
+          failedTrackKeyRef.current = currentStreamIdRef.current;
+
+          const mediaError = audio.error;
+          const mediaErrorNames: Record<number, string> = {
+            1: 'MEDIA_ERR_ABORTED',
+            2: 'MEDIA_ERR_NETWORK',
+            3: 'MEDIA_ERR_DECODE',
+            4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+          };
+          const mediaErrorCode = mediaError?.code ?? null;
+          const mediaErrorName =
+            mediaErrorCode !== null
+              ? mediaErrorNames[mediaErrorCode] || `MEDIA_ERR_${mediaErrorCode}`
+              : 'UNKNOWN_MEDIA_ERROR';
+          const mediaErrorMessage = mediaError?.message || '';
+
+          let httpStatus: number | null = null;
+          let httpStatusText = '';
+          let contentType = '';
+          let serverError = '';
+          let fetchError = '';
+
+          try {
+            const resp = await fetch(src, { headers: { Range: 'bytes=0-0' } });
+            httpStatus = resp.status;
+            httpStatusText = resp.statusText;
+            contentType = resp.headers.get('content-type') || '';
+
+            if (!resp.ok) {
+              const rawText = await resp.text().catch(() => '');
+              try {
+                const parsed = JSON.parse(rawText);
+                serverError = parsed?.error || parsed?.message || rawText;
+              } catch {
+                serverError = rawText.slice(0, 200);
+              }
+            } else {
+              await resp.body?.cancel().catch(() => {});
+            }
+          } catch (err: any) {
+            fetchError = err?.message || String(err);
+          }
+
+          console.error('[AudioPlayer] Błąd odtwarzania strumienia YouTube:', {
+            mediaErrorCode,
+            mediaErrorName,
+            mediaErrorMessage,
+            networkState: audio.networkState,
+            readyState: audio.readyState,
+            httpStatus,
+            httpStatusText,
+            contentType,
+            serverError,
+            fetchError,
+            src,
+            track: webPlayer?.nowPlaying
+              ? {
+                  id: webPlayer.nowPlaying.id,
+                  videoId: webPlayer.nowPlaying.videoId,
+                  title: webPlayer.nowPlaying.title,
+                  url: webPlayer.nowPlaying.url,
+                }
+              : null,
+          });
+
+          const errorCodeLabel =
+            mediaErrorCode !== null ? `${mediaErrorName} (#${mediaErrorCode})` : mediaErrorName;
+
+          if (httpStatus !== null && httpStatus >= 400) {
+            showToast(
+              `${serverError || `Błąd serwera strumienia (HTTP ${httpStatus})`} [${errorCodeLabel}]`,
+              'error'
+            );
+            return;
+          }
+
+          const details = [
+            errorCodeLabel,
+            httpStatus !== null ? `HTTP ${httpStatus}` : null,
+            mediaErrorMessage || null,
+            fetchError || null,
+          ]
+            .filter(Boolean)
+            .join(' • ');
+
+          showToast(`Nie udało się odtworzyć strumienia audio z YouTube (${details}).`, 'error');
+        }}
       />
 
       <Sidebar
@@ -831,7 +1023,7 @@ export default function App() {
               {activeTab === 'dashboard' && (
                 <DashboardTab
                   status={status}
-                  players={players}
+                  players={syncedPlayers}
                   searchQuery={searchQuery}
                   setSearchQuery={setSearchQuery}
                   handleSearch={handleSearch}
@@ -844,6 +1036,7 @@ export default function App() {
                   handlePlaybackToggle={handlePlaybackToggle}
                   handleVolumeChange={handleVolumeChange}
                   handleSkipForward={handleSkipForward}
+                  onSeek={handleSeekWebAudio}
                   setClearConfirmGuildId={setClearConfirmGuildId}
                   handleDragEnd={handleDragEnd}
                   handleRemoveTrack={handleRemoveTrack}

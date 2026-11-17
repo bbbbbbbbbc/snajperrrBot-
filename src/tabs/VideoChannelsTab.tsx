@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Tv,
   Play,
@@ -30,6 +30,8 @@ export const VideoChannelsTab: React.FC = () => {
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [searching, setSearching] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const loadChannels = async () => {
     try {
@@ -54,6 +56,51 @@ export const VideoChannelsTab: React.FC = () => {
   }, []);
 
   const activeChannel = channels.find((c) => c.id === selectedId) || channels[0] || null;
+
+  useEffect(() => {
+    const vid = activeChannel?.currentVideo;
+    if (!vid) return;
+
+    if (vid.provider === 'direct' && videoRef.current) {
+      if (activeChannel.isPlaying) {
+        videoRef.current.play().catch(() => {});
+      } else {
+        videoRef.current.pause();
+      }
+      return;
+    }
+
+    if (vid.provider === 'youtube' && iframeRef.current?.contentWindow) {
+      try {
+        iframeRef.current.contentWindow.postMessage(
+          JSON.stringify({
+            event: 'command',
+            func: activeChannel.isPlaying ? 'playVideo' : 'pauseVideo',
+            args: '',
+          }),
+          '*'
+        );
+      } catch {}
+    }
+  }, [activeChannel?.currentVideo?.id, activeChannel?.isPlaying]);
+
+  const resolveClientEmbedUrl = (video: VideoChannel['currentVideo']) => {
+    if (!video) return '';
+    try {
+      const u = new URL(video.embedUrl);
+      if (video.provider === 'youtube') {
+        if (!u.searchParams.has('enablejsapi')) {
+          u.searchParams.set('enablejsapi', '1');
+        }
+        return u.toString();
+      }
+      if (video.provider === 'twitch' && typeof window !== 'undefined' && window.location.hostname) {
+        u.searchParams.set('parent', window.location.hostname);
+        return u.toString();
+      }
+    } catch {}
+    return video.embedUrl;
+  };
 
   const handlePlayOrQueue = async (
     urlToUse: string,
@@ -239,16 +286,22 @@ export const VideoChannelsTab: React.FC = () => {
             {activeChannel?.currentVideo ? (
               activeChannel.currentVideo.provider === 'direct' ? (
                 <video
+                  ref={videoRef}
                   key={activeChannel.currentVideo.id}
                   src={activeChannel.currentVideo.embedUrl}
                   controls
                   autoPlay={activeChannel.isPlaying}
+                  onEnded={() => handleControl('next')}
+                  onError={() =>
+                    setErrorMsg(`Nie udało się odtworzyć wideo: ${activeChannel.currentVideo?.title || 'strumień'}`)
+                  }
                   className="w-full h-full object-contain bg-black"
                 />
               ) : (
                 <iframe
+                  ref={iframeRef}
                   key={activeChannel.currentVideo.id}
-                  src={activeChannel.currentVideo.embedUrl}
+                  src={resolveClientEmbedUrl(activeChannel.currentVideo)}
                   title={activeChannel.currentVideo.title}
                   className="w-full h-full border-0"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"

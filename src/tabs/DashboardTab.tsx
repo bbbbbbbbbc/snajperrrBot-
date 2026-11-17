@@ -40,6 +40,7 @@ interface DashboardTabProps {
   handlePlaybackToggle: (guildId: string, state: any) => void;
   handleVolumeChange: (guildId: string, vol: number) => void;
   handleSkipForward: (guildId: string) => void;
+  onSeek?: (guildId: string, seconds: number) => void;
   setClearConfirmGuildId: (id: string | null) => void;
   handleDragEnd: (event: DragEndEvent, guildId: string) => void;
   handleRemoveTrack: (guildId: string, trackId: string) => void;
@@ -76,7 +77,7 @@ function SortableQueueItem({ item, onRemove }: { item: QueueItem, onRemove: () =
 }
 
 export const DashboardTab: React.FC<DashboardTabProps> = ({
-  status, players, searchQuery, setSearchQuery, handleSearch, isSearching, searchTargetGuild, setSearchTargetGuild, searchResults, handlePlayFromWeb, formatTime, handlePlaybackToggle, handleVolumeChange, handleSkipForward, setClearConfirmGuildId, handleDragEnd, handleRemoveTrack, sensors, setShowChangelog, onRefreshPlayers
+  status, players, searchQuery, setSearchQuery, handleSearch, isSearching, searchTargetGuild, setSearchTargetGuild, searchResults, handlePlayFromWeb, formatTime, handlePlaybackToggle, handleVolumeChange, handleSkipForward, onSeek, setClearConfirmGuildId, handleDragEnd, handleRemoveTrack, sensors, setShowChangelog, onRefreshPlayers
 }) => {
   const latestVersion = CHANGELOG[0];
 
@@ -221,8 +222,29 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
                   <span>{player.nowPlaying ? formatTime(player.nowPlaying.current) : '0:00'}</span>
                   <span>{player.nowPlaying ? (player.nowPlaying.duration === 0 ? 'LIVE' : formatTime(player.nowPlaying.duration)) : '0:00'}</span>
                 </div>
-                <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
-                  <div className="h-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all" style={{ width: !player.nowPlaying ? '0%' : (player.nowPlaying.duration === 0 ? '100%' : `${(player.nowPlaying.current / player.nowPlaying.duration) * 100}%`) }} />
+                <div
+                  className={cn(
+                    "h-2 bg-white/5 rounded-full overflow-hidden",
+                    player.isWebPlayer && player.nowPlaying && player.nowPlaying.duration > 0 && "cursor-pointer hover:bg-white/10"
+                  )}
+                  onClick={(e) => {
+                    if (!player.isWebPlayer || !player.nowPlaying || player.nowPlaying.duration <= 0 || !onSeek) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                    onSeek(player.guildId, ratio * player.nowPlaying.duration);
+                  }}
+                  title={player.isWebPlayer && player.nowPlaying && player.nowPlaying.duration > 0 ? "Kliknij, aby przewinąć" : undefined}
+                >
+                  <div
+                    className="h-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all"
+                    style={{
+                      width: !player.nowPlaying
+                        ? '0%'
+                        : player.nowPlaying.duration === 0
+                          ? '100%'
+                          : `${Math.min(100, (player.nowPlaying.current / player.nowPlaying.duration) * 100)}%`,
+                    }}
+                  />
                 </div>
               </div>
               <div className="bg-[#5865F2] rounded-2xl p-4 flex items-center gap-4 relative">

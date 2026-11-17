@@ -13,23 +13,30 @@ import {
   GuildMember,
   TextChannel,
   EmbedBuilder,
+  MessageFlags,
 } from "discord.js";
 import { Player } from "discord-player";
 import { DefaultExtractors, SpotifyExtractor } from "@discord-player/extractor";
-import { YoutubeiExtractor } from "discord-player-youtubei";
+import { Constants as YTConstants } from "youtubei.js";
+import { SnajperYouTubeExtractor } from "./src/lib/SnajperYouTubeExtractor.ts";
 import { globalDownloader } from "./src/lib/AdvancedDownloader.ts";
 import {
   youtubeImporter,
+  ensureYouTubeJsEvaluator,
   extractYouTubeVideoId,
   formatDurationSec,
 } from "./src/lib/youtubeImporter.ts";
 import jwt from "jsonwebtoken";
 import Stripe from "stripe";
 import crypto from "crypto";
-import ms from "ms";
-import { GoogleGenAI } from "@google/genai";
-import db, { storeState, saveStore, type StoredUser } from "./src/db.ts";
-import { adminCommandsDefinitions, handleAdminCommands } from "./src/adminCommands.ts";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { storeState, saveStore, flushStore, type StoredUser } from "./src/db.ts";
+import {
+  adminCommandsDefinitions,
+  handleAdminCommands,
+  parseDurationMs,
+  startTempbanScheduler,
+} from "./src/adminCommands.ts";
 import {
   INTEGRATIONS_CATALOG,
   INTEGRATION_CATEGORIES,
@@ -255,7 +262,12 @@ function extractYouTubeId(inputUrl: string): string | null {
   return extractYouTubeVideoId(inputUrl);
 }
 
-function parseVideoSource(rawUrl: string, customTitle?: string, addedBy = "Web User"): VideoItem {
+function parseVideoSource(
+  rawUrl: string,
+  customTitle?: string,
+  addedBy = "Web User",
+  embedParentHost = "localhost"
+): VideoItem {
   const url = rawUrl.trim();
   const id = crypto.randomUUID();
   const addedAt = Date.now();
@@ -266,7 +278,7 @@ function parseVideoSource(rawUrl: string, customTitle?: string, addedBy = "Web U
       id,
       title: customTitle || `YouTube Video (${ytId})`,
       url: `https://www.youtube.com/watch?v=${ytId}`,
-      embedUrl: `https://www.youtube.com/embed/${ytId}?autoplay=1&rel=0`,
+      embedUrl: `https://www.youtube.com/embed/${ytId}?autoplay=1&rel=0&enablejsapi=1`,
       provider: "youtube",
       addedBy,
       addedAt,
@@ -285,8 +297,8 @@ function parseVideoSource(rawUrl: string, customTitle?: string, addedBy = "Web U
         title: customTitle || (isVod ? `Twitch VOD #${segs[1]}` : `Twitch Stream: ${channel}`),
         url,
         embedUrl: isVod
-          ? `https://player.twitch.tv/?video=${segs[1]}&parent=${parsed.hostname}&autoplay=true`
-          : `https://player.twitch.tv/?channel=${channel}&parent=${parsed.hostname}&autoplay=true`,
+          ? `https://player.twitch.tv/?video=${segs[1]}&parent=${encodeURIComponent(embedParentHost)}&autoplay=true`
+          : `https://player.twitch.tv/?channel=${channel}&parent=${encodeURIComponent(embedParentHost)}&autoplay=true`,
         provider: "twitch",
         addedBy,
         addedAt,
@@ -405,17 +417,8 @@ let extractorsLoaded = false;
 async function ensureExtractors() {
   if (extractorsLoaded) return;
   try {
-    const ytCookies = process.env.YOUTUBE_COOKIES?.trim() || undefined;
-    await player.extractors.register(YoutubeiExtractor, {
-      streamOptions: {
-        useClient: "TV_EMBEDDED",
-        highWaterMark: 1024 * 1024 * 16,
-      },
-      innertubeConfigRaw: {
-        generate_session_locally: true,
-        ...(ytCookies ? { cookie: ytCookies } : {}),
-      },
-    });
+    ensureYouTubeJsEvaluator();
+    await player.extractors.register(SnajperYouTubeExtractor, {});
     if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
       await player.extractors.register(SpotifyExtractor, {
         clientId: SPOTIFY_CLIENT_ID,
@@ -505,10 +508,47 @@ const musicCommands = [
     ),
 ];
 
+function getResilientStringOption(
+  interaction: { options: { getString: (name: string) => string | null; data: readonly any[] } },
+  preferredNames: string[]
+): string | null {
+  for (const name of preferredNames) {
+    const val = interaction.options.getString(name);
+    if (typeof val === "string" && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  for (const opt of interaction.options.data || []) {
+    if (typeof opt?.value === "string" && opt.value.trim().length > 0) {
+      return opt.value.trim();
+    }
+  }
+  return null;
+}
+
+function getResilientIntegerOption(
+  interaction: { options: { getInteger: (name: string) => number | null; data: readonly any[] } },
+  preferredNames: string[]
+): number | null {
+  for (const name of preferredNames) {
+    const val = interaction.options.getInteger(name);
+    if (typeof val === "number" && Number.isFinite(val)) {
+      return val;
+    }
+  }
+  for (const opt of interaction.options.data || []) {
+    if (typeof opt?.value === "number" && Number.isFinite(opt.value)) {
+      return Math.trunc(opt.value);
+    }
+  }
+  return null;
+}
+
 client.once("clientReady", async () => {
   botStartTime = Date.now();
   logEvent("info", "discord", `Zalogowano jako ${client.user?.tag}`);
   client.user?.setActivity("SnajperBot | /play & /video", { type: ActivityType.Listening });
+  startTempbanScheduler(client);
   await ensureExtractors();
 
   if (DISCORD_TOKEN && client.user) {
@@ -516,10 +556,26 @@ client.once("clientReady", async () => {
       const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
       const body = [...musicCommands, ...adminCommandsDefinitions].map((c) => c.toJSON());
       await rest.put(Routes.applicationCommands(client.user.id), { body });
+      // Remove any stale guild-scoped command overrides that could shadow updated global command schemas
+      await Promise.allSettled(
+        client.guilds.cache.map((guild) =>
+          rest.put(Routes.applicationGuildCommands(client.user!.id, guild.id), { body: [] })
+        )
+      );
       logEvent("info", "discord", `Zarejestrowano ${body.length} komend slash.`);
     } catch (err: any) {
       logEvent("warn", "discord", "Nie udało się zarejestrować komend slash", err?.message || "");
     }
+  }
+});
+
+client.on("guildCreate", async (guild) => {
+  if (!DISCORD_TOKEN || !client.user) return;
+  try {
+    const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: [] });
+  } catch {
+    // Non-fatal
   }
 });
 
@@ -532,7 +588,11 @@ client.on("interactionCreate", async (interaction) => {
 
     const { commandName } = interaction;
     if (commandName === "video") {
-      const url = interaction.options.getString("url", true);
+      const url = getResilientStringOption(interaction, ["url", "link", "query", "source"]);
+      if (!url) {
+        await interaction.reply({ content: "Podaj link do filmu!", flags: MessageFlags.Ephemeral });
+        return;
+      }
       const title = interaction.options.getString("title") || undefined;
       const roomName = (interaction.options.getString("channel") || "kino-ogolne").toLowerCase();
 
@@ -582,7 +642,11 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (commandName === "import") {
-      const source = interaction.options.getString("source", true);
+      const source = getResilientStringOption(interaction, ["source", "url", "link", "query"]);
+      if (!source) {
+        await interaction.reply({ content: "Podaj źródło lub link YouTube do zaimportowania!", flags: MessageFlags.Ephemeral });
+        return;
+      }
       const target = interaction.options.getString("target") || "music";
       const roomName = (interaction.options.getString("channel") || "cinema-general").toLowerCase();
       const limit = Math.max(1, Math.min(100, interaction.options.getInteger("limit") || 50));
@@ -658,7 +722,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (!interaction.guild) {
-      await interaction.reply({ content: "Tej komendy można użyć tylko na serwerze.", ephemeral: true });
+      await interaction.reply({ content: "Tej komendy można użyć tylko na serwerze.", flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -667,13 +731,30 @@ client.on("interactionCreate", async (interaction) => {
 
     if (commandName === "play") {
       if (!voiceChannel) {
-        await interaction.reply({ content: "Najpierw dołącz do kanału głosowego!", ephemeral: true });
+        await interaction.reply({ content: "Najpierw dołącz do kanału głosowego!", flags: MessageFlags.Ephemeral });
         return;
       }
-      const query = interaction.options.getString("query", true);
+      const query = getResilientStringOption(interaction, [
+        "query",
+        "song",
+        "url",
+        "link",
+        "track",
+        "szukaj",
+        "zapytanie",
+        "utwor",
+        "nazwa",
+        "tytul",
+        "source",
+      ]);
+      if (!query) {
+        await interaction.reply({ content: "Podaj nazwę utworu lub link do odtworzenia!", flags: MessageFlags.Ephemeral });
+        return;
+      }
       await interaction.deferReply();
       await ensureExtractors();
       const result = await player.play(voiceChannel, query, {
+        requestedBy: interaction.user,
         nodeOptions: { metadata: interaction.channel },
       });
       await interaction.editReply(
@@ -684,7 +765,7 @@ client.on("interactionCreate", async (interaction) => {
 
     const queue = player.nodes.get(interaction.guild.id);
     if (!queue) {
-      await interaction.reply({ content: "Aktualnie nic nie jest odtwarzane.", ephemeral: true });
+      await interaction.reply({ content: "Aktualnie nic nie jest odtwarzane.", flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -706,7 +787,12 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply("⏹️ Zatrzymano odtwarzacz i wyczyszczono kolejkę.");
         break;
       case "volume": {
-        const vol = Math.max(0, Math.min(100, interaction.options.getInteger("level", true)));
+        const rawVol = getResilientIntegerOption(interaction, ["level", "volume", "poziom"]);
+        if (rawVol === null) {
+          await interaction.reply({ content: "Podaj poziom głośności (0-100).", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const vol = Math.max(0, Math.min(100, rawVol));
         queue.node.setVolume(vol);
         await interaction.reply(`🔊 Ustawiono głośność na **${vol}%**.`);
         break;
@@ -731,7 +817,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.editReply("Wystąpił błąd podczas wykonywania komendy.").catch(() => {});
     } else {
       await interaction
-        .reply({ content: "Wystąpił błąd podczas wykonywania komendy.", ephemeral: true })
+        .reply({ content: "Wystąpił błąd podczas wykonywania komendy.", flags: MessageFlags.Ephemeral })
         .catch(() => {});
     }
   }
@@ -1018,52 +1104,174 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-app.get("/api/audio/stream", async (req, res) => {
-  const rawUrl = String(req.query.url || req.query.videoId || "").trim();
-  const videoId = extractYouTubeId(rawUrl);
-
-  if (!rawUrl) {
-    return res.status(400).json({ error: "Missing url or videoId" });
-  }
-
-  // If direct audio file URL
-  if (!videoId && /^https?:\/\//i.test(rawUrl)) {
-    return res.redirect(rawUrl);
-  }
-
-  if (!videoId) {
-    return res.status(400).json({ error: "Unsupported audio source" });
-  }
+async function pipeWebStreamToResponse(
+  webStream: ReadableStream<Uint8Array>,
+  res: express.Response,
+  abortSignal: AbortSignal
+) {
+  const reader = webStream.getReader();
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
+  abortSignal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const webStream = await youtubeImporter.openAudioStream(videoId);
-
-    res.setHeader("Content-Type", "audio/mp4");
-    res.setHeader("Cache-Control", "no-store");
-    const reader = webStream.getReader();
-
-    req.on("close", () => {
-      reader.cancel().catch(() => {});
-    });
-
-    const pump = async () => {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          res.end();
-          break;
-        }
-        if (!res.write(Buffer.from(value))) {
-          await new Promise<void>((resolve) => res.once("drain", resolve));
-        }
+    while (true) {
+      if (abortSignal.aborted || res.destroyed || res.writableEnded) break;
+      const { done, value } = await reader.read();
+      if (done) {
+        if (!res.writableEnded) res.end();
+        break;
       }
+      if (!value || value.byteLength === 0) continue;
+      if (abortSignal.aborted || res.destroyed || res.writableEnded) break;
+
+      if (!res.write(Buffer.from(value))) {
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            res.off("drain", finish);
+            res.off("close", finish);
+            abortSignal.removeEventListener("abort", finish);
+            resolve();
+          };
+          res.once("drain", finish);
+          res.once("close", finish);
+          abortSignal.addEventListener("abort", finish, { once: true });
+        });
+      }
+    }
+  } finally {
+    abortSignal.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
+}
+
+app.get("/api/audio/stream", async (req, res) => {
+  const rawUrl = String(req.query.url || req.query.videoId || "").trim();
+  const queryTitle = String(req.query.title || "").trim() || undefined;
+  const queryAuthor = String(req.query.author || "").trim() || undefined;
+  const videoId = extractYouTubeId(rawUrl);
+
+  if (!rawUrl && !queryTitle) {
+    return res.status(400).json({ error: "Missing url, videoId, or title" });
+  }
+
+  // Allow direct audio file redirects only when URL points to an actual audio stream/file
+  if (!videoId && /^https?:\/\//i.test(rawUrl)) {
+    try {
+      const parsed = new URL(rawUrl);
+      const lowerPath = parsed.pathname.toLowerCase();
+      if (/\.(mp3|m4a|aac|ogg|opus|wav|flac|webm)(\?|$)/i.test(lowerPath)) {
+        return res.redirect(rawUrl);
+      }
+    } catch {
+      // Fall through to SoundCloud bridge
+    }
+  }
+
+  const abortController = new AbortController();
+  const handleDisconnect = () => {
+    abortController.abort();
+  };
+  req.on("close", handleDisconnect);
+  res.on("close", handleDisconnect);
+
+  try {
+    const activeHints = {
+      title:
+        queryTitle ||
+        (videoId && webPlayerState.nowPlaying?.videoId === videoId
+          ? webPlayerState.nowPlaying.title
+          : undefined),
+      author:
+        queryAuthor ||
+        (videoId && webPlayerState.nowPlaying?.videoId === videoId
+          ? webPlayerState.nowPlaying.author
+          : undefined),
     };
 
-    await pump();
+    let source = videoId
+      ? await youtubeImporter.resolveAudioStreamSource(videoId, false, activeHints)
+      : await youtubeImporter.resolveSoundCloudFallback(
+          rawUrl.includes("soundcloud.com")
+            ? rawUrl
+            : [activeHints.title, activeHints.author].filter(Boolean).join(" ").trim() || rawUrl,
+          rawUrl
+        );
+
+    if (source.isLive && videoId) {
+      const webStream = await youtubeImporter.openAudioStream(videoId, activeHints);
+      res.status(200);
+      res.setHeader("Content-Type", "audio/mp4");
+      res.setHeader("Cache-Control", "no-store");
+      await pipeWebStreamToResponse(webStream, res, abortController.signal);
+      return;
+    }
+
+    if (source.hlsFmp4) {
+      const hls = await youtubeImporter.openHlsWebStream(source.url, abortController.signal);
+      res.status(200);
+      res.setHeader("Content-Type", hls.mimeType || source.mimeType || "audio/mp4");
+      res.setHeader("Cache-Control", "no-store");
+      await pipeWebStreamToResponse(hls.stream, res, abortController.signal);
+      return;
+    }
+
+    const rangeHeader = typeof req.headers.range === "string" ? req.headers.range : undefined;
+    const fetchWithHeaders = async (targetUrl: string, provider: "youtube" | "soundcloud") =>
+      fetch(targetUrl, {
+        headers: {
+          ...(provider === "youtube" ? YTConstants.STREAM_HEADERS : {}),
+          ...(rangeHeader ? { Range: rangeHeader } : {}),
+        },
+        signal: abortController.signal,
+      });
+
+    let upstream = await fetchWithHeaders(source.url, source.sourceProvider);
+    if ((upstream.status === 403 || upstream.status === 410) && videoId) {
+      await upstream.body?.cancel().catch(() => {});
+      youtubeImporter.invalidateAudioSource(videoId);
+      source = await youtubeImporter.resolveAudioStreamSource(videoId, true, activeHints);
+      if (source.hlsFmp4) {
+        const hls = await youtubeImporter.openHlsWebStream(source.url, abortController.signal);
+        res.status(200);
+        res.setHeader("Content-Type", hls.mimeType || source.mimeType || "audio/mp4");
+        res.setHeader("Cache-Control", "no-store");
+        await pipeWebStreamToResponse(hls.stream, res, abortController.signal);
+        return;
+      }
+      upstream = await fetchWithHeaders(source.url, source.sourceProvider);
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      throw new Error(`Audio stream HTTP ${upstream.status}`);
+    }
+
+    const contentType = upstream.headers.get("content-type") || source.mimeType || "audio/mp4";
+    const contentLength =
+      upstream.headers.get("content-length") ||
+      (source.contentLength && !rangeHeader ? String(source.contentLength) : null);
+    const contentRange = upstream.headers.get("content-range");
+
+    res.status(upstream.status === 206 ? 206 : 200);
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-store");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+
+    if (!upstream.body) {
+      return res.end();
+    }
+
+    await pipeWebStreamToResponse(upstream.body, res, abortController.signal);
   } catch (err: any) {
+    if (abortController.signal.aborted) return;
+    logEvent("warn", "audio-stream", `Błąd strumienia audio (${videoId || rawUrl})`, err?.message || "");
     if (!res.headersSent) {
-      res.status(502).json({ error: err?.message || "Audio stream unavailable" });
-    } else {
+      const status = /weryfikacji\/logowania|login required/i.test(err?.message || "") ? 403 : 502;
+      res.status(status).json({ error: err?.message || "Audio stream unavailable" });
+    } else if (!res.writableEnded) {
       res.end();
     }
   }
@@ -1421,7 +1629,12 @@ app.post("/api/video/channels/:channelId/play", async (req, res) => {
     }
   }
 
-  const item = parseVideoSource(url, resolvedTitle, user?.username || "Panel Web");
+  const embedHost =
+    String(req.headers["x-forwarded-host"] || req.headers.host || "localhost")
+      .split(",")[0]
+      .split(":")[0]
+      .trim() || "localhost";
+  const item = parseVideoSource(url, resolvedTitle, user?.username || "Panel Web", embedHost);
 
   if (mode === "queue" && channel.currentVideo) {
     channel.queue.push(item);
@@ -1875,7 +2088,7 @@ app.post("/api/yt-to-drive", async (req, res) => {
       return res.status(400).json({ error: "Missing url or accessToken" });
     }
 
-    const tempPath = path.join("/tmp", `dl_${Date.now()}`);
+    const tempPath = path.join("/tmp", `dl_${Date.now()}_${crypto.randomUUID().slice(0, 6)}`);
     const dlPath = await globalDownloader.download({
       url,
       format: "audio",
@@ -1885,9 +2098,10 @@ app.post("/api/yt-to-drive", async (req, res) => {
 
     const fileName = path.basename(dlPath);
     const metadata = { name: fileName, mimeType: "audio/mp4" };
+    const fileBuffer = await fs.promises.readFile(dlPath);
     const form = new FormData();
     form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-    form.append("file", new Blob([fs.readFileSync(dlPath)], { type: "audio/mp4" }), fileName);
+    form.append("file", new Blob([fileBuffer], { type: "audio/mp4" }), fileName);
 
     const uploadRes = await fetch(
       "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
@@ -1895,12 +2109,11 @@ app.post("/api/yt-to-drive", async (req, res) => {
         method: "POST",
         headers: { Authorization: `Bearer ${accessToken}` },
         body: form,
+        signal: AbortSignal.timeout(60_000),
       }
     );
     const uData = await uploadRes.json();
-    try {
-      fs.rmSync(tempPath, { recursive: true, force: true });
-    } catch {}
+    await fs.promises.rm(tempPath, { recursive: true, force: true }).catch(() => {});
 
     if (!uploadRes.ok) throw new Error(`Drive Upload Error: ${JSON.stringify(uData)}`);
     return res.json({ success: true, file: uData });
@@ -1921,6 +2134,9 @@ app.post("/api/genai/query", async (req, res) => {
     const response = await aiAssistant.models.generateContent({
       model: "gemini-4-hydrogen",
       contents: String(prompt),
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      },
     });
 
     const text = response.text || "";
@@ -1949,8 +2165,7 @@ app.post("/api/admin/users/:userId/premium", (req, res) => {
     if (durationStr === "lifetime") {
       user.premium_expires_at = null;
     } else {
-      // @ts-ignore
-      const durMs = Number(ms(durationStr)) || 30 * 86400000;
+      const durMs = parseDurationMs(String(durationStr)) ?? 30 * 86400000;
       user.premium_expires_at = Date.now() + durMs;
     }
   }
@@ -1965,9 +2180,9 @@ app.get("/api/admin/vouchers", (_req, res) => {
 app.post("/api/admin/vouchers", (req, res) => {
   const user = getAuthenticatedUser(req);
   const { type = "user_premium", durationStr = "30d", maxUses = 1 } = req.body || {};
-  // @ts-ignore
-  const durMs = durationStr === "lifetime" ? 100 * 365 * 86400000 : Number(ms(durationStr));
-  if (!durMs || Number.isNaN(durMs)) {
+  const durMs =
+    durationStr === "lifetime" ? 100 * 365 * 86400000 : parseDurationMs(String(durationStr));
+  if (!durMs) {
     return res.status(400).json({ success: false, error: "Nieprawidłowy format czasu (np. 30d)." });
   }
 
@@ -2226,7 +2441,7 @@ export class ErrorOverlay {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     // Pre-warm YouTube Innertube session + player scripts in background
     youtubeImporter.warmup().catch(() => {});
@@ -2237,6 +2452,20 @@ export class ErrorOverlay {
     } else {
       console.log("[Discord] DISCORD_TOKEN nie ustawiony — panel działa w trybie Web Channel.");
     }
+  });
+
+  const shutdown = async () => {
+    await flushStore().catch(() => {});
+    try {
+      client.destroy();
+    } catch {}
+    server.close(() => process.exit(0));
+  };
+  process.once("SIGINT", () => {
+    shutdown().catch(() => process.exit(0));
+  });
+  process.once("SIGTERM", () => {
+    shutdown().catch(() => process.exit(0));
   });
 }
 

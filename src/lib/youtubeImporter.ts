@@ -1,6 +1,45 @@
 import path from 'path';
 import fs from 'fs';
-import { Innertube, UniversalCache } from 'youtubei.js';
+import { Readable } from 'stream';
+import { Constants, Innertube, Log, Platform, UniversalCache } from 'youtubei.js';
+import { Soundcloud } from 'soundcloud.ts';
+
+let evaluatorRegistered = false;
+export function ensureYouTubeJsEvaluator(): void {
+  if (evaluatorRegistered) return;
+  evaluatorRegistered = true;
+  Log.setLevel(Log.Level.ERROR);
+  Platform.shim.eval = async (data, env) => {
+    const properties: string[] = [];
+    if (env.n) {
+      properties.push(`n: exportedVars.nFunction(${JSON.stringify(env.n)})`);
+    }
+    if (env.sig) {
+      properties.push(`sig: exportedVars.sigFunction(${JSON.stringify(env.sig)})`);
+    }
+    const code = `${data.output}\nreturn {${properties.join(', ')}};`;
+    return new Function(code)();
+  };
+}
+
+ensureYouTubeJsEvaluator();
+
+export interface ResolvedAudioSource {
+  videoId: string;
+  url: string;
+  mimeType: string;
+  contentLength: number | null;
+  client: string;
+  isLive: boolean;
+  hlsUrl?: string;
+  hlsFmp4?: boolean;
+  sourceProvider: 'youtube' | 'soundcloud';
+}
+
+export interface AudioResolutionHints {
+  title?: string;
+  author?: string;
+}
 
 export interface ImportedYouTubeTrack {
   id: string;
@@ -61,6 +100,10 @@ class LruTtlCache<T> {
 
   clear(): void {
     this.map.clear();
+  }
+
+  delete(key: string): void {
+    this.map.delete(key);
   }
 }
 
@@ -155,16 +198,19 @@ class YouTubeImporterEngine {
   private client: Innertube | null = null;
   private initPromise: Promise<Innertube> | null = null;
   private warmedUp = false;
+  private scClient: Soundcloud | null = null;
 
   // Bounded LRU + TTL caches for sub-millisecond repeat lookups
   private trackCache = new LruTtlCache<ImportedYouTubeTrack>(1000, 30 * 60 * 1000);
   private searchCache = new LruTtlCache<ImportedYouTubeTrack[]>(250, 10 * 60 * 1000);
   private playlistCache = new LruTtlCache<{ title?: string; tracks: ImportedYouTubeTrack[] }>(100, 15 * 60 * 1000);
+  private audioSourceCache = new LruTtlCache<ResolvedAudioSource>(250, 5 * 60 * 1000);
 
   // In-flight deduplication maps
   private trackInFlight = new Map<string, Promise<ImportedYouTubeTrack>>();
   private searchInFlight = new Map<string, Promise<ImportedYouTubeTrack[]>>();
   private playlistInFlight = new Map<string, Promise<{ title?: string; tracks: ImportedYouTubeTrack[] }>>();
+  private audioSourceInFlight = new Map<string, Promise<ResolvedAudioSource>>();
 
   // Telemetry
   private cacheHits = 0;
@@ -175,6 +221,7 @@ class YouTubeImporterEngine {
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
+      ensureYouTubeJsEvaluator();
       const cacheDir = path.join(process.cwd(), 'data', 'yt-cache');
       if (!fs.existsSync(cacheDir)) {
         fs.mkdirSync(cacheDir, { recursive: true });
@@ -212,8 +259,14 @@ class YouTubeImporterEngine {
     this.trackCache.clear();
     this.searchCache.clear();
     this.playlistCache.clear();
+    this.audioSourceCache.clear();
     this.cacheHits = 0;
     this.cacheMisses = 0;
+  }
+
+  public invalidateAudioSource(videoId: string): void {
+    const cleanId = extractYouTubeVideoId(videoId) || videoId.trim();
+    this.audioSourceCache.delete(cleanId);
   }
 
   public getStats() {
@@ -594,29 +647,448 @@ class YouTubeImporterEngine {
     };
   }
 
+  private getSoundcloudClient(): Soundcloud {
+    if (!this.scClient) {
+      this.scClient = new Soundcloud();
+    }
+    return this.scClient;
+  }
+
   /**
-   * Opens a high-reliability audio stream using multi-client fallback
-   * (TV_EMBEDDED -> ANDROID -> WEB).
+   * Resolves track title/author even when YouTube player endpoint returns LOGIN_REQUIRED.
    */
-  public async openAudioStream(videoId: string): Promise<ReadableStream<Uint8Array>> {
+  public async resolveMetadataHints(
+    videoId: string,
+    hints?: AudioResolutionHints
+  ): Promise<{ title?: string; author?: string }> {
+    const cleanTitle = hints?.title?.trim();
+    const cleanAuthor = hints?.author?.trim();
+    if (cleanTitle) {
+      return { title: cleanTitle, author: cleanAuthor };
+    }
+
+    const cached = this.trackCache.get(videoId);
+    if (cached?.title) {
+      return { title: cached.title, author: cached.author };
+    }
+
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+        `https://www.youtube.com/watch?v=${videoId}`
+      )}&format=json`;
+      const resp = await fetch(oembedUrl, { signal: AbortSignal.timeout(4000) });
+      if (resp.ok) {
+        const data = (await resp.json()) as { title?: string; author_name?: string };
+        if (data?.title) {
+          return {
+            title: data.title,
+            author: data.author_name || cleanAuthor,
+          };
+        }
+      }
+    } catch {
+      // Non-fatal; fallback to next method
+    }
+
+    return { title: cleanTitle, author: cleanAuthor };
+  }
+
+  /**
+   * Resolves a playable unencrypted SoundCloud stream (progressive MP3 or fMP4/MP3 HLS)
+   * for any text query or SoundCloud URL. Skips DRM-encrypted HLS and 30s Go+ previews.
+   */
+  public async resolveSoundCloudFallback(
+    query: string,
+    cacheKey = query
+  ): Promise<ResolvedAudioSource> {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) {
+      throw new Error('Brak tytułu utworu do wyszukania strumienia zapasowego.');
+    }
+
+    const sc = this.getSoundcloudClient();
+    const clientId = await sc.api.getClientId();
+
+    const pickPlayableTranscoding = (track: any) => {
+      const list = Array.isArray(track?.media?.transcodings) ? track.media.transcodings : [];
+      const progressive = list.find(
+        (tr: any) =>
+          tr?.format?.protocol === 'progressive' &&
+          typeof tr?.url === 'string' &&
+          tr.url.length > 0
+      );
+      if (progressive) return progressive;
+
+      const hlsMp4 = list.find(
+        (tr: any) =>
+          tr?.format?.protocol === 'hls' &&
+          String(tr?.format?.mime_type || '').includes('audio/mp4') &&
+          typeof tr?.url === 'string'
+      );
+      if (hlsMp4) return hlsMp4;
+
+      return list.find(
+        (tr: any) => tr?.format?.protocol === 'hls' && typeof tr?.url === 'string'
+      );
+    };
+
+    let candidate: any = null;
+    if (/^https?:\/\/(www\.)?(soundcloud\.com|on\.soundcloud\.com)\//i.test(cleanQuery)) {
+      try {
+        candidate = await sc.tracks.getV2(cleanQuery);
+      } catch {
+        candidate = null;
+      }
+    }
+
+    if (!candidate || !pickPlayableTranscoding(candidate)) {
+      const searchRes = await sc.tracks.searchV2({ q: cleanQuery, limit: 15 });
+      const collection = Array.isArray(searchRes?.collection) ? searchRes.collection : [];
+
+      candidate =
+        collection.find((t: any) => Number(t?.duration || 0) > 35_000 && Boolean(pickPlayableTranscoding(t))) ||
+        collection.find((t: any) => Boolean(pickPlayableTranscoding(t))) ||
+        null;
+    }
+
+    if (!candidate) {
+      throw new Error(`Nie znaleziono strumienia audio dla "${cleanQuery}".`);
+    }
+
+    const transcoding = pickPlayableTranscoding(candidate);
+    if (!transcoding) {
+      throw new Error(`Brak obsługiwanych formatów strumienia dla "${cleanQuery}".`);
+    }
+
+    const trackAuth = candidate.track_authorization
+      ? `&track_authorization=${encodeURIComponent(candidate.track_authorization)}`
+      : '';
+    const sep = transcoding.url.includes('?') ? '&' : '?';
+    const resolveResp = await fetch(
+      `${transcoding.url}${sep}client_id=${encodeURIComponent(clientId)}${trackAuth}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!resolveResp.ok) {
+      throw new Error(`SoundCloud stream resolve HTTP ${resolveResp.status}`);
+    }
+    const resolveJson = (await resolveResp.json()) as { url?: string };
+    const resolvedUrl = resolveJson?.url;
+    if (!resolvedUrl) {
+      throw new Error('SoundCloud zwrócił pusty adres strumienia.');
+    }
+
+    const isHls = transcoding.format?.protocol === 'hls';
+    const rawMime =
+      String(transcoding.format?.mime_type || (isHls ? 'audio/mp4' : 'audio/mpeg'))
+        .split(';')[0]
+        .trim() || 'audio/mp4';
+
+    const resolved: ResolvedAudioSource = {
+      videoId: cacheKey,
+      url: resolvedUrl,
+      mimeType: rawMime === 'audio/mpegurl' ? 'audio/mpeg' : rawMime,
+      contentLength: null,
+      client: 'SOUNDCLOUD_BRIDGE',
+      isLive: false,
+      hlsFmp4: isHls,
+      sourceProvider: 'soundcloud',
+    };
+
+    this.audioSourceCache.set(cacheKey, resolved);
+    return resolved;
+  }
+
+  /**
+   * Resolves a verified, range-capable direct YouTube audio CDN URL with multi-client
+   * fallback (IOS -> MWEB -> ANDROID_VR -> WEB), JS cipher evaluation, 200/206 validation,
+   * and automatic SoundCloud Bridge fallback when datacenter IPs hit LOGIN_REQUIRED.
+   */
+  public async resolveAudioStreamSource(
+    videoIdOrUrl: string,
+    forceRefresh = false,
+    hints?: AudioResolutionHints
+  ): Promise<ResolvedAudioSource> {
+    const videoId = extractYouTubeVideoId(videoIdOrUrl) || videoIdOrUrl.trim();
+    if (!forceRefresh) {
+      const cached = this.audioSourceCache.get(videoId);
+      if (cached && cached.url) {
+        this.cacheHits++;
+        return cached;
+      }
+    }
+
+    const inFlight = !forceRefresh ? this.audioSourceInFlight.get(videoId) : undefined;
+    if (inFlight) return inFlight;
+
+    this.cacheMisses++;
+    const promise = (async (): Promise<ResolvedAudioSource> => {
+      const yt = await this.getClient();
+      const clients = ['IOS', 'MWEB', 'ANDROID_VR', 'WEB'] as const;
+      let lastError: unknown = null;
+
+      for (const client of clients) {
+        try {
+          const info = await yt.getBasicInfo(videoId, { client });
+
+          if (info.basic_info?.is_live && info.streaming_data?.hls_manifest_url) {
+            const liveSource: ResolvedAudioSource = {
+              videoId,
+              url: info.streaming_data.hls_manifest_url,
+              mimeType: 'application/vnd.apple.mpegurl',
+              contentLength: null,
+              client,
+              isLive: true,
+              hlsUrl: info.streaming_data.hls_manifest_url,
+              sourceProvider: 'youtube',
+            };
+            this.audioSourceCache.set(videoId, liveSource);
+            return liveSource;
+          }
+
+          let fmt: any = null;
+          try {
+            fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
+          } catch {
+            fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'any' });
+          }
+
+          const decipheredUrl = await fmt.decipher(yt.session.player);
+          if (!decipheredUrl) {
+            throw new Error('Empty deciphered stream URL');
+          }
+
+          // Verify CDN URL responds 200/206 (filters out 403 clients immediately)
+          const probe = await fetch(decipheredUrl, {
+            method: 'GET',
+            headers: {
+              ...Constants.STREAM_HEADERS,
+              Range: 'bytes=0-0',
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+          await probe.body?.cancel().catch(() => {});
+
+          if (!probe.ok && probe.status !== 206) {
+            throw new Error(`YouTube CDN responded HTTP ${probe.status} for client ${client}`);
+          }
+
+          const rawMime = String(fmt.mime_type || 'audio/mp4').split(';')[0].trim() || 'audio/mp4';
+          const contentLength =
+            typeof fmt.content_length === 'number' && fmt.content_length > 0
+              ? fmt.content_length
+              : null;
+
+          const resolved: ResolvedAudioSource = {
+            videoId,
+            url: decipheredUrl,
+            mimeType: rawMime,
+            contentLength,
+            client,
+            isLive: false,
+            sourceProvider: 'youtube',
+          };
+          this.audioSourceCache.set(videoId, resolved);
+          return resolved;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      // Automatic SoundCloud Audio Bridge when YouTube blocks datacenter IPs or live recording is unavailable
+      try {
+        const meta = await this.resolveMetadataHints(videoId, hints);
+        const bridgeQuery = [meta.title, meta.author].filter(Boolean).join(' ').trim();
+        if (bridgeQuery) {
+          return await this.resolveSoundCloudFallback(bridgeQuery, videoId);
+        }
+      } catch {
+        // Fall through to detailed error below
+      }
+
+      const rawMsg = lastError instanceof Error ? lastError.message : String(lastError || 'Audio stream unavailable');
+      if (/login required|streaming data not available|confirm you.?re not a bot/i.test(rawMsg)) {
+        throw new Error(
+          'YouTube wymaga weryfikacji/logowania dla tego utworu i nie znaleziono zapasowego strumienia (ustaw YOUTUBE_COOKIES lub spróbuj inny utwór).'
+        );
+      }
+      throw lastError instanceof Error ? lastError : new Error('Audio stream unavailable');
+    })();
+
+    this.audioSourceInFlight.set(videoId, promise);
+    try {
+      return await promise;
+    } finally {
+      this.audioSourceInFlight.delete(videoId);
+    }
+  }
+
+  /**
+   * Streams an unencrypted HLS playlist (fMP4 init+segments or MP3 segments) lazily
+   * segment-by-segment with backpressure so first byte starts in ~150ms.
+   */
+  public async openHlsWebStream(
+    m3u8Url: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ stream: ReadableStream<Uint8Array>; mimeType?: string }> {
+    const manifestResp = await fetch(m3u8Url, {
+      signal: abortSignal ?? AbortSignal.timeout(10_000),
+    });
+    if (!manifestResp.ok) {
+      throw new Error(`HLS manifest HTTP ${manifestResp.status}`);
+    }
+    const m3u8Text = await manifestResp.text();
+    const mapMatch = m3u8Text.match(/#EXT-X-MAP:URI="([^"]+)"/i);
+    const baseUrl = new URL(m3u8Url);
+    const toAbs = (raw: string) => new URL(raw, baseUrl).toString();
+
+    const segmentUrls: string[] = [];
+    if (mapMatch?.[1]) {
+      segmentUrls.push(toAbs(mapMatch[1]));
+    }
+    for (const line of m3u8Text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      segmentUrls.push(toAbs(trimmed));
+    }
+
+    if (segmentUrls.length === 0) {
+      throw new Error('HLS playlist contains no audio segments');
+    }
+
+    const detectedMime = mapMatch?.[1] ? 'audio/mp4' : 'audio/mpeg';
+    let index = 0;
+    let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          while (true) {
+            if (abortSignal?.aborted) {
+              await currentReader?.cancel().catch(() => {});
+              controller.close();
+              return;
+            }
+
+            if (!currentReader) {
+              if (index >= segmentUrls.length) {
+                controller.close();
+                return;
+              }
+              const segUrl = segmentUrls[index++];
+              const segResp = await fetch(segUrl, { signal: abortSignal });
+              if (!segResp.ok || !segResp.body) {
+                throw new Error(`HLS segment HTTP ${segResp.status}`);
+              }
+              currentReader = segResp.body.getReader();
+            }
+
+            const { done, value } = await currentReader.read();
+            if (done) {
+              currentReader = null;
+              continue;
+            }
+            if (value && value.byteLength > 0) {
+              controller.enqueue(value);
+              return;
+            }
+          }
+        } catch (err) {
+          if (abortSignal?.aborted) {
+            controller.close();
+          } else {
+            controller.error(err);
+          }
+        }
+      },
+      async cancel() {
+        await currentReader?.cancel().catch(() => {});
+        currentReader = null;
+      },
+    });
+
+    return { stream, mimeType: detectedMime };
+  }
+
+  /**
+   * Opens a high-reliability Web ReadableStream using verified multi-client resolution
+   * (IOS -> MWEB -> ANDROID_VR -> WEB) or SoundCloud Bridge fallback.
+   */
+  public async openAudioStream(
+    videoId: string,
+    hints?: AudioResolutionHints
+  ): Promise<ReadableStream<Uint8Array>> {
+    const source = await this.resolveAudioStreamSource(videoId, false, hints);
+    if (source.hlsFmp4) {
+      const hls = await this.openHlsWebStream(source.url);
+      return hls.stream;
+    }
+
+    if (!source.isLive) {
+      const resp = await fetch(source.url, {
+        headers: source.sourceProvider === 'youtube' ? Constants.STREAM_HEADERS : {},
+      });
+      if (resp.ok && resp.body) {
+        return resp.body;
+      }
+    }
+
     const yt = await this.getClient();
-    const clients = ['TV_EMBEDDED', 'ANDROID', 'WEB'] as const;
+    const clients = ['IOS', 'MWEB', 'ANDROID_VR', 'WEB'] as const;
     let lastError: unknown = null;
 
     for (const client of clients) {
-      try {
-        return await yt.download(videoId, {
-          type: 'audio',
-          quality: 'best',
-          format: 'mp4',
-          client,
-        });
-      } catch (err) {
-        lastError = err;
+      for (const format of ['mp4', 'any'] as const) {
+        try {
+          return await yt.download(videoId, {
+            type: 'audio',
+            quality: 'best',
+            format,
+            client,
+          });
+        } catch (err) {
+          lastError = err;
+        }
       }
     }
 
     throw lastError instanceof Error ? lastError : new Error('Audio stream unavailable');
+  }
+
+  /**
+   * Opens a Node.js Readable stream (or HLS URL string for live streams) for discord-player.
+   */
+  public async openNodeAudioStream(
+    videoIdOrUrl: string,
+    hints?: AudioResolutionHints
+  ): Promise<Readable | string> {
+    const videoId = extractYouTubeVideoId(videoIdOrUrl) || videoIdOrUrl.trim();
+    const source = await this.resolveAudioStreamSource(videoId, false, hints);
+    if (source.isLive && source.hlsUrl) {
+      return source.hlsUrl;
+    }
+    if (source.hlsFmp4) {
+      const hls = await this.openHlsWebStream(source.url);
+      return Readable.fromWeb(hls.stream as any);
+    }
+
+    const headers = source.sourceProvider === 'youtube' ? Constants.STREAM_HEADERS : {};
+    const resp = await fetch(source.url, { headers });
+    if (!resp.ok || !resp.body) {
+      const refreshed = await this.resolveAudioStreamSource(videoId, true, hints);
+      if (refreshed.isLive && refreshed.hlsUrl) return refreshed.hlsUrl;
+      if (refreshed.hlsFmp4) {
+        const hls = await this.openHlsWebStream(refreshed.url);
+        return Readable.fromWeb(hls.stream as any);
+      }
+      const retryResp = await fetch(refreshed.url, {
+        headers: refreshed.sourceProvider === 'youtube' ? Constants.STREAM_HEADERS : {},
+      });
+      if (!retryResp.ok || !retryResp.body) {
+        throw new Error(`YouTube stream HTTP ${retryResp.status}`);
+      }
+      return Readable.fromWeb(retryResp.body as any);
+    }
+    return Readable.fromWeb(resp.body as any);
   }
 }
 
